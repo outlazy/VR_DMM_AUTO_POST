@@ -1,0 +1,7 @@
+requests
+beautifulsoup4
+lxml
+tenacity
+python-slugify
+pytz
+python-wordpress-xmlrpc==2.3
