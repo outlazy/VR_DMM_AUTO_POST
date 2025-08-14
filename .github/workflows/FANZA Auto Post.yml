@@ -1,0 +1,47 @@
+name: FANZA Auto Post
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */4 * * *'
+
+jobs:
+  auto_post:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Uninstall old python-wordpress-xmlrpc
+        run: pip uninstall -y python-wordpress-xmlrpc
+
+      - name: Remove pip cache
+        run: pip cache purge
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Show python-wordpress-xmlrpc version
+        run: pip show python-wordpress-xmlrpc
+
+      - name: Check Python version
+        run: python --version
+
+      - name: Run FANZA auto post script
+        env:
+          WP_URL: ${{ secrets.WP_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_PASS: ${{ secrets.WP_PASS }}
+          DMM_API_ID: ${{ secrets.DMM_API_ID }}
+          DMM_AFFILIATE_ID: ${{ secrets.DMM_AFFILIATE_ID }}
+          CATEGORY: ${{ secrets.CATEGORY }}
+        run: python fanza_auto_post.py
