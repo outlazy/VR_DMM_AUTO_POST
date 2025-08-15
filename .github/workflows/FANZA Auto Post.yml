@@ -1,42 +1,46 @@
-name: fanza_vr_auto_post
+name: FANZA VR Auto Post
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:      # 手動実行OK
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: "*/30 * * * *"  # 30分ごと（UTC）。JSTは+9時間
 
 jobs:
-  auto_post:
+  run:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.9
-        uses: actions/setup-python@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Uninstall old python-wordpress-xmlrpc
-        run: pip uninstall -y python-wordpress-xmlrpc
+      # （任意）到達性チェック：WP_URL のDNS/接続を事前確認
+      - name: Preflight: resolve & HEAD xmlrpc
+        env:
+          WP_URL: ${{ secrets.WP_URL }}
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+import os, socket, urllib.parse, requests
+u = urllib.parse.urlparse(os.environ['WP_URL'].strip())
+host = u.hostname
+print("Host:", host)
+print("DNS:", socket.gethostbyname(host))
+r = requests.head(os.environ['WP_URL'].strip(), timeout=12, allow_redirects=True)
+print("HEAD status:", r.status_code)
+PY
 
-      - name: Remove pip cache
-        run: pip cache purge
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Show python-wordpress-xmlrpc version
-        run: pip show python-wordpress-xmlrpc
-
-      - name: Check Python version
-        run: python --version
-
-      - name: Run FANZA auto post script
+      - name: Run VR auto post
         env:
           WP_URL: ${{ secrets.WP_URL }}
           WP_USER: ${{ secrets.WP_USER }}
@@ -44,4 +48,4 @@ jobs:
           DMM_API_ID: ${{ secrets.DMM_API_ID }}
           DMM_AFFILIATE_ID: ${{ secrets.DMM_AFFILIATE_ID }}
           CATEGORY: ${{ secrets.CATEGORY }}
-        run: fanza_vr_auto_post.py
+        run: python fanza_vr_auto_post.py
