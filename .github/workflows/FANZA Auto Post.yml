@@ -1,7 +1,9 @@
 name: FANZA VR Auto Post (Manual)
 
 on:
-  workflow_dispatch: {}   # ← 手動実行ボタン用（これだけにする）
+  workflow_dispatch: {}
+  schedule:
+    - cron: "*/30 * * * *"  # 30分ごと（JSTは+9時間）
 
 permissions:
   contents: read
