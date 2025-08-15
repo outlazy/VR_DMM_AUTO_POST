@@ -21,6 +21,7 @@ jobs:
 
       - name: Run VR auto post
         env:
+          FORCE_DETAIL_DOMAIN: "www"
           WP_URL: ${{ secrets.WP_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_PASS: ${{ secrets.WP_PASS }}
