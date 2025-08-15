@@ -260,6 +260,8 @@ def _build_candidate_urls(item: dict, original_url: str) -> list[str]:
             f"https://www.dmm.co.jp/digital/vrvideo/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/vrvideo/-/detail/=/cid={cid}/",
             f"https://video.dmm.co.jp/av/content/?id={cid}",
+            f"https://www.dmm.co.jp/av/-/detail/=/cid={cid}/",          # 追加1
+    f"https://www.dmm.co.jp/mono/dvd/-/detail/=/cid={cid}/",    # 追加2（保険）
         ])
 
     extra: list[str] = []
