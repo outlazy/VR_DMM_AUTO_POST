@@ -324,7 +324,12 @@ def fetch_description_from_detail_page(url, item):
     for i, u in enumerate(_build_candidate_urls(item, url), 1):
         try:
             resp = requests.get(u, headers=headers, timeout=12, allow_redirects=True)
-            html_txt = resp.text
+            html_bytes = resp.content  # ← 重要: bytesで受ける（文字化け回避）
+         try:
+    soup = BeautifulSoup(html_bytes, "lxml")
+except Exception:
+    soup = BeautifulSoup(html_bytes, "html.parser")
+html_txt = str(soup)  # 正規化したHTML文字列にして既存ロジックへ
             desc, src = pick_from_html(html_txt)
             if desc:
                 print(f"説明抽出: {src} / {u}")
