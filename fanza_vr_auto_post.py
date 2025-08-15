@@ -287,9 +287,9 @@ def is_released(item) -> bool:
         return False
 
 # ---- DMM共通呼び出し（詳細ログ & NG判定つき）----
-DMM_API_URL = "https://api.dmm.com/affiliate/v3/ItemList"
 
 def dmm_request(params):
+    """DMM APIを叩いて、HTTPエラー時は本文を出しつつ例外、result.status=NGも例外化"""
     r = requests.get(DMM_API_URL, params=params, timeout=12)
     if r.status_code != 200:
         try:
@@ -304,6 +304,7 @@ def dmm_request(params):
         msg = res.get("message") or res.get("error", "")
         raise RuntimeError(f"DMM API NG: {msg}")
     return res
+
 
 def fetch_all_vr_released_sorted():
     """新着順ページを連結し、発売済みVRのみを発売日降順で返す（keyword=VRがNGなら自動フォールバック）"""
@@ -352,6 +353,7 @@ def fetch_all_vr_released_sorted():
     print(f"VR発売済み件数: {len(released)}（日付降順）")
     return released
 
+
 def split_recent_and_backlog(items):
     """直近RECENT_DAYS以内と、それ以外（バックログ）に分割"""
     boundary = now_jst() - timedelta(days=RECENT_DAYS)
@@ -368,6 +370,7 @@ def split_recent_and_backlog(items):
             backlog.append(it)
     return recent, backlog
 
+
 def upload_image(wp, url):
     try:
         data = requests.get(url, timeout=12).content
@@ -378,6 +381,7 @@ def upload_image(wp, url):
     except Exception as e:
         print(f"画像アップロード失敗: {url} ({e})")
         return None
+
 
 def create_wp_post(item, wp, category, aff_id):
     title = item["title"]
@@ -431,6 +435,7 @@ def create_wp_post(item, wp, category, aff_id):
     wp.call(posts.NewPost(post))
     print(f"✔ 投稿完了: {title}")
     return True
+
 
 def main():
     jst_now = now_jst()
