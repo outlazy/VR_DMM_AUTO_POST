@@ -2,20 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-FANZA（DMM）VR新着 → WordPress自動投稿（本文抽出・Cookie対応・新作優先・Indent安全版）
+FANZA（DMM）VR新着 → WordPress自動投稿（本文抽出・Cookie対応・www優先・404除外）
 
-使い方（GitHub Actions例）
-- Secrets: WP_URL / WP_USER / WP_PASS / DMM_API_ID / DMM_AFFILIATE_ID / CATEGORY
-- Env（任意）: POST_LIMIT=2 / RECENT_DAYS=3 / MAX_PAGES=6 / HITS=30 / SCRAPE_DESC=1
-                 AGE_GATE_COOKIE="ckcy=1; age_check_done=1"（任意・自分の年齢同意Cookie）
-                 FORCE_DETAIL_DOMAIN=www（任意: www または video を優先）
+ポイント（今回の修正）
+- `FORCE_DETAIL_DOMAIN` の既定を `www` に。`video` 側で404を踏むケース（savr系など）を回避
+- 候補URLに `https://www.dmm.co.jp/av/-/detail/=/cid=.../` と `https://www.dmm.co.jp/mono/dvd/-/detail/=/cid=.../` を追加
+- 詳細取得時に **HTTP 404** を検知したら即座に次候補へ（テキスト判定前にスキップ）
+- レスポンスは **bytes→BeautifulSoup** でパースし、文字化けやmeta不一致を吸収
+- 年齢認証ページは検知してフォールバック（回避はしない）
 
-ポイント
-- 年齢認証に引っかかったら本文抽出を諦めてAPI/自動生成にフォールバック（回避はしない）
-- レスポンスは bytes から BeautifulSoup でパース（文字化け/エンコード問題を回避）
-- DMM API offset=1 始まり。keyword=VR 失敗時は keyword なしで再試行
-- 直近 RECENT_DAYS 日を優先投稿、不足分はバックログ（発売日降順）
-- Python3.10+ の collections.* 互換パッチ込み
+必要 Secrets/Env
+  WP_URL / WP_USER / WP_PASS / DMM_API_ID / DMM_AFFILIATE_ID / CATEGORY
+任意 Env
+  POST_LIMIT=2 / RECENT_DAYS=3 / MAX_PAGES=6 / HITS=30 / SCRAPE_DESC=1
+  AGE_GATE_COOKIE="ckcy=1; age_check_done=1"（自分の年齢同意Cookie）
+  FORCE_DETAIL_DOMAIN=www（www優先。videoにしたいときだけ変更）
 """
 
 import os
@@ -54,9 +55,9 @@ MAX_PAGES   = int(os.environ.get("MAX_PAGES", "6"))   # 探索最大ページ数
 HITS        = int(os.environ.get("HITS", "30"))       # 1ページ取得件数
 POST_LIMIT  = int(os.environ.get("POST_LIMIT", "2"))  # 1回の実行で投稿する最大件数
 RECENT_DAYS = int(os.environ.get("RECENT_DAYS", "3")) # 直近何日を“新作”とみなすか
-SCRAPE_DESC = os.environ.get("SCRAPE_DESC", "1") == "1"  # 1=商品ページ本文優先で抽出, 0=完全無効
+SCRAPE_DESC = os.environ.get("SCRAPE_DESC", "1") == "1"  # 1=本文抽出有効
 AGE_GATE_COOKIE = os.environ.get("AGE_GATE_COOKIE", "").strip()  # 例: "ckcy=1; age_check_done=1"
-FORCE_DETAIL_DOMAIN = os.environ.get("FORCE_DETAIL_DOMAIN", "").strip()  # "video" / "www"（任意）
+FORCE_DETAIL_DOMAIN = os.environ.get("FORCE_DETAIL_DOMAIN", "www").strip()  # 既定を www
 # =========================================
 
 NG_DESCRIPTIONS = [
@@ -70,6 +71,7 @@ AGE_MARKERS = [
     "under the age of 18", "age verification"
 ]
 
+# ------------------ 共通ユーティリティ ------------------
 
 def now_jst() -> datetime:
     return datetime.now(pytz.timezone('Asia/Tokyo'))
@@ -259,9 +261,9 @@ def _build_candidate_urls(item: dict, original_url: str) -> list[str]:
             f"https://www.dmm.co.jp/digital/videoa/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/digital/vrvideo/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/vrvideo/-/detail/=/cid={cid}/",
+            f"https://www.dmm.co.jp/av/-/detail/=/cid={cid}/",       # 追加
+            f"https://www.dmm.co.jp/mono/dvd/-/detail/=/cid={cid}/", # 追加（保険）
             f"https://video.dmm.co.jp/av/content/?id={cid}",
-            f"https://www.dmm.co.jp/av/-/detail/=/cid={cid}/",          # 追加1
-    f"https://www.dmm.co.jp/mono/dvd/-/detail/=/cid={cid}/",    # 追加2（保険）
         ])
 
     extra: list[str] = []
@@ -311,12 +313,16 @@ def fetch_description_from_detail_page(url: str, item: dict) -> str:
     for i, u in enumerate(candidates, 1):
         try:
             resp = requests.get(u, headers=headers, timeout=12, allow_redirects=True)
-            html_bytes = resp.content  # ← 重要: bytesで受ける
+            # 404 は即スキップ（video側で多発するため）
+            if resp.status_code == 404:
+                print(f"説明抽出: 404 / {u}")
+                continue
+            html_bytes = resp.content  # bytesで受ける
             desc = extract_main_description_from_html_bytes(html_bytes)
             if desc and is_valid_description(desc):
                 print(f"説明抽出: OK / {u}")
                 return desc
-            # 年齢認証/404/未検出の場合は次候補へ
+            # 年齢認証/未検出の場合は次候補へ
         except Exception as e:
             last_err = e
             print(f"説明抽出失敗({i}/{len(candidates)}): {u} ({e})")
@@ -496,7 +502,7 @@ def create_wp_post(item: dict, wp: Client, category: str, aff_id: str) -> bool:
 
 def main():
     jst_now = now_jst()
-    print(f"[{jst_now.strftime('%Y-%m-%d %H:%M:%S')}] VR新着投稿開始（優先: 直近{RECENT_DAYS}日／不足分はバックログ／SCRAPE_DESC={'ON' if SCRAPE_DESC else 'OFF'}）")
+    print(f"[{jst_now.strftime('%Y-%m-%d %H:%M:%S')}] VR新着投稿開始（www優先／直近{RECENT_DAYS}日→バックログ／SCRAPE_DESC={'ON' if SCRAPE_DESC else 'OFF'}）")
     try:
         WP_URL = get_env('WP_URL').strip()
         WP_USER = get_env('WP_USER')
