@@ -1,26 +1,19 @@
-name: FANZA VR Auto Post (Manual)
+name: FANZA VR Auto Post (Stable)
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "*/30 * * * *"  # 30分ごと（JSTは+9時間）
-
-permissions:
-  contents: read
+    - cron: "0 */6 * * *"   # 6時間おき（UTC）
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
@@ -34,4 +27,8 @@ jobs:
           DMM_API_ID: ${{ secrets.DMM_API_ID }}
           DMM_AFFILIATE_ID: ${{ secrets.DMM_AFFILIATE_ID }}
           CATEGORY: ${{ secrets.CATEGORY }}
+          POST_LIMIT: "2"     # 1回で2本
+          RECENT_DAYS: "3"    # 直近3日を“新作”扱い
+          HITS: "30"
+          MAX_PAGES: "6"
         run: python fanza_vr_auto_post.py
