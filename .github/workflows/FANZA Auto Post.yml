@@ -1,4 +1,4 @@
-name: FANZA Auto Post
+name: fanza_vr_auto_post
 
 on:
   workflow_dispatch:
@@ -44,4 +44,4 @@ jobs:
           DMM_API_ID: ${{ secrets.DMM_API_ID }}
           DMM_AFFILIATE_ID: ${{ secrets.DMM_AFFILIATE_ID }}
           CATEGORY: ${{ secrets.CATEGORY }}
-        run: python fanza_auto_post.py
+        run: fanza_vr_auto_post.py
