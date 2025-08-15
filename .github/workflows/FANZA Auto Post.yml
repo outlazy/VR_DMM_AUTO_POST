@@ -29,6 +29,7 @@ jobs:
           CATEGORY: ${{ secrets.CATEGORY }}
           POST_LIMIT: "2"     # 1回で2本
           RECENT_DAYS: "3"    # 直近3日を“新作”扱い
+          SCRAPE_DESC: "0"  # ← 安全運用なら0のまま推奨
           HITS: "30"
           MAX_PAGES: "6"
         run: python fanza_vr_auto_post.py
