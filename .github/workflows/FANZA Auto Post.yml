@@ -1,14 +1,14 @@
-name: FANZA VR Auto Post
+name: FANZA VR Auto Post (Manual)
 
 on:
-  workflow_dispatch: {} # 手動実行OK
-  schedule:
-    - cron: "*/30 * * * *"  # 30分ごと（UTC）。JSTは+9時間
+  workflow_dispatch: {}   # ← 手動実行ボタン用（これだけにする）
+
+permissions:
+  contents: read
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,22 +23,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      # （任意）到達性チェック：WP_URL のDNS/接続を事前確認
-      - name: Preflight: resolve & HEAD xmlrpc
-        env:
-          WP_URL: ${{ secrets.WP_URL }}
-        run: |
-          set -euxo pipefail
-          python - <<'PY'
-import os, socket, urllib.parse, requests
-u = urllib.parse.urlparse(os.environ['WP_URL'].strip())
-host = u.hostname
-print("Host:", host)
-print("DNS:", socket.gethostbyname(host))
-r = requests.head(os.environ['WP_URL'].strip(), timeout=12, allow_redirects=True)
-print("HEAD status:", r.status_code)
-PY
 
       - name: Run VR auto post
         env:
