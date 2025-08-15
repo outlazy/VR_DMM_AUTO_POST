@@ -9,16 +9,17 @@ FANZA（DMM）アフィリエイトAPIで VR 単品の新着を取得 → WordPr
 - APIは新着(sort=date)に未来日が混ざるので、ローカルで「発売済のみ」を抽出して発売日降順に整列
 - DMM APIの offset は 1 始まり（1, 1+HITS, ...）に対応
 - keyword=VR で 400/NG の場合は keyword なしに自動フォールバック
-- 商品ページから説明文を抽出したい場合は SCRAPE_DESC=1 で有効化
-  - 年齢認証ページと判断したら即フォールバック（API説明→自動生成）
-  - UA/Referer付与・HTMLエンティティデコード・文字数レンジで品質担保
+- 説明文は「商品ページ本文（イントロ）」を最優先で抽出（SCRAPE_DESC=1で有効・既定ON）
+  - #introduction / .introduction / 見出し「作品紹介/内容/ストーリー/あらすじ/解説」の直下段落 等を総当り
+  - 失敗時は og:description → meta description → JSON-LD → API説明 → 自動生成の順にフォールバック
+  - 年齢認証ページ文面を検知したら即フォールバック（回避はしない）
 - Python 3.10+ の collections.* 廃止対応モンキーパッチ（古いライブラリ対策）
 - 既投稿はタイトル一致でスキップ（強化したければ content_id 埋め込み検知も拡張可）
 
 ◎必要な Secrets（GitHub Actions）
   WP_URL / WP_USER / WP_PASS / DMM_API_ID / DMM_AFFILIATE_ID / CATEGORY
 ◎オプション env（未設定なら右の既定値）
-  MAX_PAGES=6, HITS=30, POST_LIMIT=2, RECENT_DAYS=3, SCRAPE_DESC=0
+  MAX_PAGES=6, HITS=30, POST_LIMIT=2, RECENT_DAYS=3, SCRAPE_DESC=1
 """
 
 import os
@@ -44,6 +45,12 @@ from wordpress_xmlrpc.methods import media, posts
 from wordpress_xmlrpc.methods.posts import GetPosts
 from wordpress_xmlrpc.compat import xmlrpc_client
 
+# ▼ HTMLパース（beautifulsoup4 / lxml 推奨）
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+
 DMM_API_URL = "https://api.dmm.com/affiliate/v3/ItemList"
 
 # ===== 可変パラメータ（envで上書き可） =====
@@ -51,7 +58,7 @@ MAX_PAGES   = int(os.environ.get("MAX_PAGES", "6"))   # 探索最大ページ数
 HITS        = int(os.environ.get("HITS", "30"))       # 1ページ取得件数
 POST_LIMIT  = int(os.environ.get("POST_LIMIT", "2"))  # 1回の実行で投稿する最大件数
 RECENT_DAYS = int(os.environ.get("RECENT_DAYS", "3")) # 直近何日を“新作”とみなすか
-SCRAPE_DESC = os.environ.get("SCRAPE_DESC", "0") == "1"  # 1=商品ページから説明抽出を試行, 0=無効（API/自動生成のみ）
+SCRAPE_DESC = os.environ.get("SCRAPE_DESC", "1") == "1"  # 1=商品ページ本文優先で抽出, 0=完全無効
 # =========================================
 
 NG_DESCRIPTIONS = [
@@ -60,15 +67,12 @@ NG_DESCRIPTIONS = [
     "アダルト商品を取り扱う", "成人向け", "アダルトサイト", "ご利用は18歳以上",
 ]
 
-
 def now_jst():
     return datetime.now(pytz.timezone('Asia/Tokyo'))
-
 
 def parse_jst_date(s: str):
     jst = pytz.timezone('Asia/Tokyo')
     return jst.localize(datetime.strptime(s, "%Y-%m-%d %H:%M:%S"))
-
 
 def get_env(key, required=True, default=None):
     v = os.environ.get(key, default)
@@ -76,14 +80,12 @@ def get_env(key, required=True, default=None):
         raise RuntimeError(f"環境変数 {key} が設定されていません")
     return v
 
-
 def make_affiliate_link(url, aff_id):
     parsed = urlparse(url)
     qs = dict(parse_qsl(parsed.query))
     qs["affiliate_id"] = aff_id
     new_query = urlencode(qs)
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
-
 
 def is_valid_description(desc: str) -> bool:
     if not desc or len(desc.strip()) < 30:
@@ -93,7 +95,7 @@ def is_valid_description(desc: str) -> bool:
             return False
     return True
 
-
+# ---------- 説明文フォールバック ----------
 def fallback_description(item):
     """APIの説明 or 自動生成。年齢認証ページ検出時やスクレイピング無効時もここに来る。"""
     ii = item.get("iteminfo", {}) or {}
@@ -109,10 +111,84 @@ def fallback_description(item):
     base = f"{title}。ジャンル：{genres}。出演：{cast}。レーベル：{label}。収録時間：{volume}。"
     return base if len(base) > 10 else "FANZA（DMM）VR動画の自動投稿です。"
 
+# ---------- 本文ブロック抽出 ----------
+def extract_main_description(html_txt: str):
+    """商品ページの本文（紹介/ストーリー等）から説明文を抽出。失敗時は None。"""
+    if not SCRAPE_DESC or not BeautifulSoup or not html_txt:
+        return None
+    try:
+        try:
+            soup = BeautifulSoup(html_txt, "lxml")
+        except Exception:
+            soup = BeautifulSoup(html_txt, "html.parser")
+    except Exception:
+        return None
 
+    candidates = []
+
+    # 1) よくあるID/クラス
+    for sel in [
+        "#introduction", "section#introduction", "div#introduction",
+        ".introduction", "section.introduction", '[data-contents="introduction"]',
+        "#performer + div",
+    ]:
+        for n in soup.select(sel):
+            txt = n.get_text(" ", strip=True)
+            if txt:
+                candidates.append(txt)
+
+    # 2) 見出し「作品紹介/内容/ストーリー/あらすじ/解説」の直後の段落群
+    for h in soup.find_all(["h2", "h3", "h4"]):
+        ht = (h.get_text(strip=True) or "")
+        if any(k in ht for k in ["作品紹介", "作品内容", "ストーリー", "あらすじ", "解説"]):
+            parts = []
+            sib = h.find_next_sibling()
+            while sib and sib.name not in ["h2", "h3", "h4"]:
+                if sib.name in ["p", "div", "section"]:
+                    t = sib.get_text(" ", strip=True)
+                    if t:
+                        parts.append(t)
+                sib = sib.find_next_sibling()
+            if parts:
+                candidates.append("\n".join(parts))
+
+    # 3) やや長めの段落も保険で収集
+    for p in soup.find_all("p"):
+        t = p.get_text(" ", strip=True)
+        if t and len(t) >= 60:
+            candidates.append(t)
+
+    def clean(s: str) -> str:
+        s = html.unescape(s or "").strip()
+        s = re.sub(r"\s{2,}", " ", s)
+        for b in ["18歳未満", "成人向け", "アダルトサイト", "ご利用は18歳以上", "年齢認証", "無修正"]:
+            s = s.replace(b, "")
+        return s.strip()
+
+    def ok(s: str) -> bool:
+        s = s.strip()
+        if not (60 <= len(s) <= 1200):
+            return False
+        for ng in ["利用規約", "Cookie", "会員登録", "プライバシー"]:
+            if ng in s:
+                return False
+        return True
+
+    best = None
+    best_score = -1
+    for c in candidates:
+        c2 = clean(c)
+        if not ok(c2):
+            continue
+        score = len(c2) + 20 * (c2.count("。") + c2.count("！") + c2.count("？"))
+        if score > best_score:
+            best = c2
+            best_score = score
+    return best
+
+# ---------- 説明文抽出メイン ----------
 def fetch_description_from_detail_page(url, item):
     """商品ページから説明文を抽出。年齢認証ページやNG時は即フォールバック。"""
-    # スクレイピング無効化スイッチ
     if not SCRAPE_DESC:
         return fallback_description(item)
 
@@ -130,7 +206,7 @@ def fetch_description_from_detail_page(url, item):
         r.raise_for_status()
         html_txt = r.text
 
-        # 年齢認証ページっぽい文言を検知したら即フォールバック
+        # 年齢認証ページっぽい文言を検知したら即フォールバック（回避はしない）
         age_gate_markers = [
             "18歳未満", "未満の方のアクセス", "成人向け", "アダルトサイト",
             "under the age of 18", "age verification"
@@ -138,13 +214,15 @@ def fetch_description_from_detail_page(url, item):
         if any(k in html_txt for k in age_gate_markers):
             return fallback_description(item)
 
+        # 1) 本文ブロック優先
+        main_desc = extract_main_description(html_txt)
+        if main_desc and is_valid_description(main_desc):
+            return main_desc
+
+        # 2) og:description
         def clean(s: str) -> str:
             s = html.unescape(s).strip()
-            BAD = [
-                "アダルトサイト", "18歳未満", "成人向け", "From here on",
-                "ご利用は18歳以上", "adult", "無修正", "違法"
-            ]
-            for b in BAD:
+            for b in ["アダルトサイト", "18歳未満", "成人向け", "From here on", "ご利用は18歳以上"]:
                 s = s.replace(b, "")
             s = re.sub(r"\s{2,}", " ", s)
             return s.strip()
@@ -152,25 +230,21 @@ def fetch_description_from_detail_page(url, item):
         def ok(s: str) -> bool:
             return bool(s) and 30 <= len(s.strip()) <= 700 and is_valid_description(s)
 
-        # 1) og:description
         m = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']', html_txt, re.I)
         if m:
             desc = clean(m.group(1))
             if ok(desc):
                 return desc
 
-        # 2) meta name=description
+        # 3) meta name=description
         m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']', html_txt, re.I)
         if m:
             desc = clean(m.group(1))
             if ok(desc):
                 return desc
 
-        # 3) すべての JSON-LD を総当り
-        for m in re.finditer(
-            r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-            html_txt, re.S | re.I
-        ):
+        # 4) JSON-LD 総当り
+        for m in re.finditer(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html_txt, re.S | re.I):
             raw = m.group(1).strip()
             try:
                 data = json.loads(raw)
@@ -193,17 +267,15 @@ def fetch_description_from_detail_page(url, item):
         print(f"商品ページ説明抽出失敗: {e}")
         time.sleep(0.2)  # 軽いバックオフ
 
-    # 最後はAPI系/自動生成へ
+    # 5) 最後はAPI系/自動生成へ
     return fallback_description(item)
 
-
+# ---------- 判定 ----------
 def contains_vr(item) -> bool:
-    """ iteminfo->genre に VR 系タグが含まれるかを判定 """
     ii = item.get("iteminfo", {}) or {}
     names = [g.get("name", "") for g in ii.get("genre", []) if isinstance(g, dict)]
     joined = " ".join(names)
     return ("VR" in joined) or ("ＶＲ" in joined) or ("バーチャル" in joined)
-
 
 def is_released(item) -> bool:
     ds = item.get("date")
@@ -214,10 +286,10 @@ def is_released(item) -> bool:
     except Exception:
         return False
 
-
 # ---- DMM共通呼び出し（詳細ログ & NG判定つき）----
+DMM_API_URL = "https://api.dmm.com/affiliate/v3/ItemList"
+
 def dmm_request(params):
-    """DMM APIを叩いて、HTTPエラー時は本文を出しつつ例外、result.status=NGも例外化"""
     r = requests.get(DMM_API_URL, params=params, timeout=12)
     if r.status_code != 200:
         try:
@@ -232,7 +304,6 @@ def dmm_request(params):
         msg = res.get("message") or res.get("error", "")
         raise RuntimeError(f"DMM API NG: {msg}")
     return res
-
 
 def fetch_all_vr_released_sorted():
     """新着順ページを連結し、発売済みVRのみを発売日降順で返す（keyword=VRがNGなら自動フォールバック）"""
@@ -276,12 +347,10 @@ def fetch_all_vr_released_sorted():
             break
         all_items.extend(items)
 
-    # 発売済み＋VR判定 → 発売日降順
     released = [it for it in all_items if contains_vr(it) and is_released(it)]
     released.sort(key=lambda x: x.get('date', ''), reverse=True)
     print(f"VR発売済み件数: {len(released)}（日付降順）")
     return released
-
 
 def split_recent_and_backlog(items):
     """直近RECENT_DAYS以内と、それ以外（バックログ）に分割"""
@@ -297,9 +366,7 @@ def split_recent_and_backlog(items):
             recent.append(it)
         else:
             backlog.append(it)
-    # どちらも発売日降順のまま
     return recent, backlog
-
 
 def upload_image(wp, url):
     try:
@@ -311,7 +378,6 @@ def upload_image(wp, url):
     except Exception as e:
         print(f"画像アップロード失敗: {url} ({e})")
         return None
-
 
 def create_wp_post(item, wp, category, aff_id):
     title = item["title"]
@@ -334,7 +400,7 @@ def create_wp_post(item, wp, category, aff_id):
         return False
     thumb_id = upload_image(wp, images[0]) if images else None
 
-    # タグ抽出
+    # タグ
     tags = set()
     ii = item.get("iteminfo", {}) or {}
     for key in ("label", "maker", "actress", "genre"):
@@ -356,22 +422,20 @@ def create_wp_post(item, wp, category, aff_id):
     parts.append(f'<p><a href="{aff_link}" target="_blank">{title}</a></p>')
 
     post = WordPressPost()
-    post.title = title  # バッジ付けたいなら： post.title = "【VR】" + title
+    post.title = title
     post.content = "\n".join(parts)
     if thumb_id:
         post.thumbnail = thumb_id
     post.terms_names = {"category": [category], "post_tag": list(tags)}
-    post.post_status = "publish"  # 下書き運用なら "draft"
+    post.post_status = "publish"
     wp.call(posts.NewPost(post))
     print(f"✔ 投稿完了: {title}")
     return True
-
 
 def main():
     jst_now = now_jst()
     print(f"[{jst_now.strftime('%Y-%m-%d %H:%M:%S')}] VR新着投稿開始（優先: 直近{RECENT_DAYS}日／不足分はバックログ／SCRAPE_DESC={'ON' if SCRAPE_DESC else 'OFF'}）")
     try:
-        # 準備
         WP_URL = get_env('WP_URL').strip()
         WP_USER = get_env('WP_USER')
         WP_PASS = get_env('WP_PASS')
@@ -379,21 +443,16 @@ def main():
         AFF_ID = get_env('DMM_AFFILIATE_ID')
         wp = Client(WP_URL, WP_USER, WP_PASS)
 
-        # 取得・整形
         all_released = fetch_all_vr_released_sorted()
         recent, backlog = split_recent_and_backlog(all_released)
         print(f"直近{RECENT_DAYS}日: {len(recent)} / バックログ: {len(backlog)}")
 
-        # 投稿
         posted = 0
-        # 1) 直近分を優先
         for item in recent:
             if create_wp_post(item, wp, CATEGORY, AFF_ID):
                 posted += 1
                 if posted >= POST_LIMIT:
                     break
-
-        # 2) まだ足りなければバックログ（発売日降順）
         if posted < POST_LIMIT:
             for item in backlog:
                 if create_wp_post(item, wp, CATEGORY, AFF_ID):
@@ -408,7 +467,6 @@ def main():
     except Exception as e:
         print(f"エラー: {e}")
     print(f"[{now_jst().strftime('%Y-%m-%d %H:%M:%S')}] VR新着投稿終了")
-
 
 if __name__ == "__main__":
     main()
