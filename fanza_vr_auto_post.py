@@ -2,19 +2,30 @@
 # -*- coding: utf-8 -*-
 
 """
-FANZA（DMM）アフィリエイトAPIで VR 単品の新着を取得 →
-1) 発売済 & 直近RECENT_DAYS以内を優先して投稿
-2) 足りない分は発売済バックログ（新しい順）で補完
-・offsetは1始まり
-・keyword=VRがNGなら自動でkeywordなしへフォールバック
-・Py3.10+ の collections.* 廃止に互換パッチ適用
-・Secrets: WP_URL / WP_USER / WP_PASS / DMM_API_ID / DMM_AFFILIATE_ID / CATEGORY
-・オプション: MAX_PAGES(6), HITS(30), POST_LIMIT(2), RECENT_DAYS(3)
+FANZA（DMM）アフィリエイトAPIで VR 単品の新着を取得 → WordPress 自動投稿
+
+◎仕様まとめ
+- 直近RECENT_DAYS日以内の「発売済VR」を優先投稿。足りなければバックログ（発売済の過去作/新しい順）で補完
+- APIは新着(sort=date)に未来日が混ざるので、ローカルで「発売済のみ」を抽出して発売日降順に整列
+- DMM APIの offset は 1 始まり（1, 1+HITS, ...）に対応
+- keyword=VR で 400/NG の場合は keyword なしに自動フォールバック
+- 商品ページから説明文を高精度で抽出（og:description / meta description / JSON-LD 全総当り）
+  - UA/Referer付与・HTMLエンティティデコード・注意書き除去・文字数レンジで品質担保
+  - 取れない場合は APIフィールド or 自動生成にフォールバック
+- Python 3.10+ の collections.* 廃止対応モンキーパッチ（古いライブラリ対策）
+- 既投稿はタイトル一致でスキップ（より強くしたいなら content_id 埋め込み検知も後で足せる）
+
+◎必要な Secrets（GitHub Actions）
+  WP_URL / WP_USER / WP_PASS / DMM_API_ID / DMM_AFFILIATE_ID / CATEGORY
+◎オプション env（未設定なら右の既定値）
+  MAX_PAGES=6, HITS=30, POST_LIMIT=2, RECENT_DAYS=3
 """
 
 import os
 import re
 import json
+import html
+import time
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from datetime import datetime, timedelta
 
@@ -77,40 +88,91 @@ def is_valid_description(desc: str) -> bool:
     return True
 
 def fetch_description_from_detail_page(url, item):
-    """商品ページ <meta name=description> / JSON-LD の description を抽出。NGならAPI/自動生成にフォールバック。"""
+    """商品ページから説明文を高精度抽出。NGならAPI/自動生成へフォールバック。"""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Referer": "https://video.dmm.co.jp/",
+    }
     try:
-        r = requests.get(url, timeout=12)
+        r = requests.get(url, headers=headers, timeout=12)
         r.raise_for_status()
-        html = r.text
+        html_txt = r.text
 
-        # 1) <meta name="description" content="...">
-        m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        def clean(s: str) -> str:
+            s = html.unescape(s).strip()
+            BAD = [
+                "アダルトサイト", "18歳未満", "成人向け", "From here on",
+                "ご利用は18歳以上", "adult", "エログ", "無修正", "違法"
+            ]
+            for b in BAD:
+                s = s.replace(b, "")
+            # 余分な空白/改行を整形
+            s = re.sub(r"\s{2,}", " ", s)
+            return s.strip()
+
+        def ok(s: str) -> bool:
+            if not s:
+                return False
+            s = s.strip()
+            # 短すぎ/長すぎ排除（サイトに合わせて調整可）
+            return 30 <= len(s) <= 700 and is_valid_description(s)
+
+        # 1) og:description
+        m = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']', html_txt, re.I)
         if m:
-            desc = m.group(1).strip()
-            if is_valid_description(desc):
+            desc = clean(m.group(1))
+            if ok(desc): 
                 return desc
 
-        # 2) JSON-LD の "description"
-        m_script = re.search(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', html, re.DOTALL | re.IGNORECASE)
-        if m_script:
+        # 2) meta name=description
+        m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']', html_txt, re.I)
+        if m:
+            desc = clean(m.group(1))
+            if ok(desc): 
+                return desc
+
+        # 3) すべての JSON-LD を総当り
+        for m in re.finditer(
+            r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html_txt, re.S | re.I
+        ):
+            raw = m.group(1).strip()
             try:
-                jd = json.loads(m_script.group(1))
-                desc = jd.get("description") or (jd.get("subjectOf") or {}).get("description", "")
-                if is_valid_description(desc):
-                    return desc.strip()
+                data = json.loads(raw)
             except Exception:
-                pass
+                continue
+            candidates = data if isinstance(data, list) else [data]
+            for jd in candidates:
+                if isinstance(jd, dict):
+                    # 直接
+                    if "description" in jd:
+                        desc = clean(str(jd["description"]))
+                        if ok(desc): 
+                            return desc
+                    # ネスト（例: subjectOf.description）
+                    sub = jd.get("subjectOf")
+                    if isinstance(sub, dict) and "description" in sub:
+                        desc = clean(str(sub["description"]))
+                        if ok(desc): 
+                            return desc
+
     except Exception as e:
         print(f"商品ページ説明抽出失敗: {e}")
+        time.sleep(0.2)  # 軽いバックオフ
 
-    # 3) APIデータでフォールバック
+    # 4) API系フィールドでフォールバック
     ii = item.get("iteminfo", {}) or {}
     for key in ("description", "comment", "story"):
-        val = item.get(key) or ii.get(key)
-        if is_valid_description(val or ""):
+        val = (item.get(key) or ii.get(key) or "").strip()
+        if 20 <= len(val) <= 800 and is_valid_description(val):
             return val
 
-    # 4) 自動生成
+    # 5) 最終フォールバック（自動生成）
     cast = "、".join([a["name"] for a in ii.get("actress", []) if "name" in a])
     label = "、".join([l["name"] for l in ii.get("label", []) if "name" in l])
     genres = "、".join([g["name"] for g in ii.get("genre", []) if "name" in g])
@@ -259,7 +321,7 @@ def create_wp_post(item, wp, category, aff_id):
                     tags.add(v["name"])
 
     aff_link = make_affiliate_link(item["URL"], aff_id)
-    desc = fetch_description_from_detail_page(item["URL"], item) or "FANZA（DMM）VR動画の自動投稿です。"
+    desc = fetch_description_from_detail_page(item["URL"], item)
 
     parts = []
     parts.append(f'<p><a href="{aff_link}" target="_blank"><img src="{images[0]}" alt="{title}"></a></p>')
@@ -271,12 +333,12 @@ def create_wp_post(item, wp, category, aff_id):
     parts.append(f'<p><a href="{aff_link}" target="_blank">{title}</a></p>')
 
     post = WordPressPost()
-    post.title = title
+    post.title = title  # バッジ付けたいなら： post.title = "【VR】" + title
     post.content = "\n".join(parts)
     if thumb_id:
         post.thumbnail = thumb_id
     post.terms_names = {"category": [category], "post_tag": list(tags)}
-    post.post_status = "publish"  # 下書き運用にしたい場合は "draft"
+    post.post_status = "publish"  # 下書き運用なら "draft"
     wp.call(posts.NewPost(post))
     print(f"✔ 投稿完了: {title}")
     return True
