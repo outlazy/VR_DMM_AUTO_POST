@@ -3,9 +3,10 @@
 
 """
 FANZA（DMM）アフィリエイトAPIで VR 単品の新着を取得 → 発売済のみを日付降順で WordPress 投稿
-・offset は 1 始まり（必須）に修正
-・keyword=VR が 400/NG の時は keyword なしで自動フォールバック
-・発売済のみ抽出して発売日降順に整列
+・offset は 1 始まり
+・keyword=VR が 400/NG の時は keyword なしに自動フォールバック
+・発売済のみ抽出し、発売日降順で整列
+・Py3.10+ の collections.* 廃止対応パッチを先頭に適用（wordpress_xmlrpcの古い参照対策）
 ・Secrets: WP_URL / WP_USER / WP_PASS / DMM_API_ID / DMM_AFFILIATE_ID / CATEGORY
 ・オプション環境変数: MAX_PAGES(既定6), HITS(既定30), POST_LIMIT(既定1)
 """
@@ -15,6 +16,14 @@ import re
 import json
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from datetime import datetime
+
+# ---- Py3.10+ 互換パッチ（古いライブラリの collections.* 参照対策）----
+import collections as _collections
+import collections.abc as _abc
+for _name in ("Iterable", "Mapping", "MutableMapping", "Sequence"):
+    if not hasattr(_collections, _name) and hasattr(_abc, _name):
+        setattr(_collections, _name, getattr(_abc, _name))
+# ---------------------------------------------------------------------
 
 import pytz
 import requests
@@ -156,15 +165,14 @@ def fetch_vr_released_items_sorted():
             "sort": "date",      # 新着順（未来含む）
             "output": "json",
             "hits": HITS,
-            "offset": offset,    # ★ 1 始まりに注意
+            "offset": offset,    # ★ 1 始まり
         }
         if use_keyword:
             p["keyword"] = "VR"   # 粗フィルタ（ダメなら外す）
         return p
 
     for page in range(MAX_PAGES):
-        # ★ offset は 1, 1+HITS, 1+2*HITS, ...
-        offset = 1 + page * HITS
+        offset = 1 + page * HITS  # 1, 1+HITS, 1+2*HITS, ...
         print(f"[page {page+1}] fetch (offset={offset}) with keyword=VR")
         try:
             res = dmm_request(base_params(offset, use_keyword=True))
@@ -183,7 +191,7 @@ def fetch_vr_released_items_sorted():
             break
         all_items.extend(items)
 
-    # 発売済み＋VR判定でフィルタ → 発売日降順（最新→古い）
+    # 発売済み＋VR判定 → 発売日降順
     released = [it for it in all_items if contains_vr(it) and is_released(it)]
     released.sort(key=lambda x: x.get('date', ''), reverse=True)
     print(f"VR発売済み件数: {len(released)}（日付降順）")
