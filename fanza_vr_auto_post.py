@@ -3,8 +3,9 @@
 
 """
 FANZA（DMM）アフィリエイトAPIで VR 単品の新着を取得 → 発売済のみを日付降順で WordPress 投稿
-・APIは新着(sort=date)に未来の発売予定も含むため、ローカルで「発売済」だけに絞り、発売日降順で整列
-・一部環境で keyword=VR が 400/NG になる場合があるため、自動で keyword なしにフォールバック
+・offset は 1 始まり（必須）に修正
+・keyword=VR が 400/NG の時は keyword なしで自動フォールバック
+・発売済のみ抽出して発売日降順に整列
 ・Secrets: WP_URL / WP_USER / WP_PASS / DMM_API_ID / DMM_AFFILIATE_ID / CATEGORY
 ・オプション環境変数: MAX_PAGES(既定6), HITS(既定30), POST_LIMIT(既定1)
 """
@@ -155,14 +156,15 @@ def fetch_vr_released_items_sorted():
             "sort": "date",      # 新着順（未来含む）
             "output": "json",
             "hits": HITS,
-            "offset": offset,
+            "offset": offset,    # ★ 1 始まりに注意
         }
         if use_keyword:
             p["keyword"] = "VR"   # 粗フィルタ（ダメなら外す）
         return p
 
     for page in range(MAX_PAGES):
-        offset = page * HITS
+        # ★ offset は 1, 1+HITS, 1+2*HITS, ...
+        offset = 1 + page * HITS
         print(f"[page {page+1}] fetch (offset={offset}) with keyword=VR")
         try:
             res = dmm_request(base_params(offset, use_keyword=True))
