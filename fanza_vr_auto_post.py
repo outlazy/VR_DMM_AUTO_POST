@@ -2,26 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-FANZA（DMM）アフィリエイトAPIで VR 単品の新着を取得 → WordPress 自動投稿（本文抽出つきフル版）
+FANZA（DMM）VR新着 → WordPress自動投稿（本文抽出・Cookie対応・新作優先・Indent安全版）
 
-主な仕様
-- 直近 RECENT_DAYS 日の "発売済" VR を優先し、不足分はバックログ（発売日降順）で補完
-- DMM API: sort=date は未来が混ざるため、ローカルで発売日<=現在のものだけにフィルタ
-- offset は 1 始まり（1, 1+HITS, ...）に対応
-- keyword=VR 失敗時は keyword なしで自動フォールバック
-- 説明文は商品ページの本文（紹介/ストーリー等）を最優先で抽出（SCRAPE_DESC=1 で有効）
-  * 年齢認証文面を検知したら即フォールバック（回避はしない）
-  * Cookie を環境変数（AGE_GATE_COOKIE）から付与可能（先生自身のクッキーのみ想定）
-  * 本文セレクタ強化（.mg-b20.lh4 / .txt / #introduction など）
-  * 取れない場合は og:description → meta description → JSON-LD → API説明 → 自動生成
-- 既投稿はタイトル一致でスキップ
-- Python3.10+ の collections.Iterable 問題に互換パッチ
+使い方（GitHub Actions例）
+- Secrets: WP_URL / WP_USER / WP_PASS / DMM_API_ID / DMM_AFFILIATE_ID / CATEGORY
+- Env（任意）: POST_LIMIT=2 / RECENT_DAYS=3 / MAX_PAGES=6 / HITS=30 / SCRAPE_DESC=1
+                 AGE_GATE_COOKIE="ckcy=1; age_check_done=1"（任意・自分の年齢同意Cookie）
+                 FORCE_DETAIL_DOMAIN=www（任意: www または video を優先）
 
-必要 Secrets/Env（GitHub Actions 例）
-  WP_URL / WP_USER / WP_PASS / DMM_API_ID / DMM_AFFILIATE_ID / CATEGORY
-  POST_LIMIT=2 / RECENT_DAYS=3 / MAX_PAGES=6 / HITS=30 / SCRAPE_DESC=1
-  AGE_GATE_COOKIE="ckcy=1; age_check_done=1"（任意・先生自身のクッキー）
-  FORCE_DETAIL_DOMAIN=www（任意: www または video を優先）
+ポイント
+- 年齢認証に引っかかったら本文抽出を諦めてAPI/自動生成にフォールバック（回避はしない）
+- レスポンスは bytes から BeautifulSoup でパース（文字化け/エンコード問題を回避）
+- DMM API offset=1 始まり。keyword=VR 失敗時は keyword なしで再試行
+- 直近 RECENT_DAYS 日を優先投稿、不足分はバックログ（発売日降順）
+- Python3.10+ の collections.* 互換パッチ込み
 """
 
 import os
@@ -71,24 +65,29 @@ NG_DESCRIPTIONS = [
     "アダルト商品を取り扱う", "成人向け", "アダルトサイト", "ご利用は18歳以上",
 ]
 
+AGE_MARKERS = [
+    "18歳未満", "未満の方のアクセス", "成人向け", "アダルトサイト",
+    "under the age of 18", "age verification"
+]
 
-def now_jst():
+
+def now_jst() -> datetime:
     return datetime.now(pytz.timezone('Asia/Tokyo'))
 
 
-def parse_jst_date(s: str):
+def parse_jst_date(s: str) -> datetime:
     jst = pytz.timezone('Asia/Tokyo')
     return jst.localize(datetime.strptime(s, "%Y-%m-%d %H:%M:%S"))
 
 
-def get_env(key, required=True, default=None):
+def get_env(key: str, required: bool = True, default=None):
     v = os.environ.get(key, default)
     if required and not v:
         raise RuntimeError(f"環境変数 {key} が設定されていません")
     return v
 
 
-def make_affiliate_link(url, aff_id):
+def make_affiliate_link(url: str, aff_id: str) -> str:
     parsed = urlparse(url)
     qs = dict(parse_qsl(parsed.query))
     qs["affiliate_id"] = aff_id
@@ -106,7 +105,7 @@ def is_valid_description(desc: str) -> bool:
 
 # ------------------ フォールバック（API/自動生成） ------------------
 
-def fallback_description(item):
+def fallback_description(item: dict) -> str:
     ii = item.get("iteminfo", {}) or {}
     for key in ("description", "comment", "story"):
         val = (item.get(key) or ii.get(key) or "").strip()
@@ -120,7 +119,7 @@ def fallback_description(item):
     base = f"{title}。ジャンル：{genres}。出演：{cast}。レーベル：{label}。収録時間：{volume}。"
     return base if len(base) > 10 else "FANZA（DMM）VR動画の自動投稿です。"
 
-# ------------------ 本文抽出（セレクタ強化） ------------------
+# ------------------ 本文抽出（セレクタ強化＋bytes→Soup） ------------------
 
 def _clean_text(s: str) -> str:
     s = html.unescape(s or "").strip()
@@ -130,42 +129,42 @@ def _clean_text(s: str) -> str:
     return s.strip()
 
 
-def extract_main_description(html_txt: str):
-    if not SCRAPE_DESC or not BeautifulSoup or not html_txt:
+def extract_main_description_from_html_bytes(html_bytes: bytes) -> str | None:
+    if not SCRAPE_DESC or not BeautifulSoup or not html_bytes:
         return None
     try:
         try:
-            soup = BeautifulSoup(html_txt, "lxml")
+            soup = BeautifulSoup(html_bytes, "lxml")
         except Exception:
-            soup = BeautifulSoup(html_txt, "html.parser")
+            soup = BeautifulSoup(html_bytes, "html.parser")
     except Exception:
         return None
 
-    candidates = []
+    # 年齢認証/404っぽい判定（軽量）
+    raw_text = soup.get_text(" ", strip=True)
+    if any(k in raw_text for k in AGE_MARKERS):
+        return None
 
-    # 1) DMMでよく見る本文ブロック（www側）
-    # 例: <div class="mg-b20 lh4"> ... 説明 ... </div>
+    candidates: list[str] = []
+
+    # 1) DMMでよく見る本文ブロック
     for sel in [
-        "div.mg-b20.lh4",          # 代表的な本文
-        "div#introduction",        # ID版
-        "section#introduction",
-        "div.introduction",
-        "section.introduction",
-        '[data-contents="introduction"]',
-        ".vbox .txt",               # VR系のテキストブロックで見かけることがある
-        ".d-item__intro",          # 新デザイン仮
-        "#performer + div",        # 出演者ブロック直後
+        "div.mg-b20.lh4",
+        "div#introduction", "section#introduction", "div.introduction", "section.introduction",
+        "[data-contents='introduction']",
+        ".vbox .txt", ".d-item__intro", "#performer + div",
+        ".txt",
     ]:
         for n in soup.select(sel):
-            t = n.get_text(" ", strip=True)
+            t = n.get_text("\n", strip=True)
             if t:
                 candidates.append(t)
 
-    # 2) 見出しが「作品紹介/内容/ストーリー/あらすじ/解説」
+    # 2) 見出し→直後の段落群
     for h in soup.find_all(["h1", "h2", "h3", "h4"]):
         ht = (h.get_text(strip=True) or "")
         if any(k in ht for k in ["作品紹介", "作品内容", "ストーリー", "あらすじ", "解説"]):
-            parts = []
+            parts: list[str] = []
             sib = h.find_next_sibling()
             while sib and sib.name not in ["h1", "h2", "h3", "h4"]:
                 if sib.name in ["p", "div", "section"]:
@@ -176,7 +175,7 @@ def extract_main_description(html_txt: str):
             if parts:
                 candidates.append("\n".join(parts))
 
-    # 3) やや長めの段落を保険で
+    # 3) 長めの段落（保険）
     for p in soup.find_all("p"):
         t = p.get_text(" ", strip=True)
         if t and len(t) >= 60:
@@ -201,52 +200,84 @@ def extract_main_description(html_txt: str):
         if score > best_score:
             best = c2
             best_score = score
-    return best
+    if best:
+        return best
+
+    # 4) og:description / meta description / JSON-LD
+    m = soup.select_one('meta[property="og:description"]')
+    if m and m.get("content"):
+        d = _clean_text(m["content"])
+        if 30 <= len(d) <= 700 and is_valid_description(d):
+            return d
+
+    m = soup.select_one('meta[name="description"]')
+    if m and m.get("content"):
+        d = _clean_text(m["content"])
+        if 30 <= len(d) <= 700 and is_valid_description(d):
+            return d
+
+    for s in soup.select('script[type="application/ld+json"]'):
+        try:
+            data = json.loads(s.get_text(strip=True))
+        except Exception:
+            continue
+        arr = data if isinstance(data, list) else [data]
+        for jd in arr:
+            if isinstance(jd, dict) and "description" in jd:
+                d = _clean_text(str(jd["description"]))
+                if 30 <= len(d) <= 700 and is_valid_description(d):
+                    return d
+    return None
 
 # ------------------ URL候補生成（www/video 両面） ------------------
 
-def _build_candidate_urls(item, original_url: str):
-    urls = []
-    # 1) 元URLから affiliate 系を除去
+def _strip_affiliate_params(u: str) -> str:
     try:
-        pu = urlparse(original_url)
+        pu = urlparse(u)
         q = dict(parse_qsl(pu.query))
         for k in list(q.keys()):
             if k.lower() in {"affiliate_id", "affi_id", "uid", "af_id"}:
                 q.pop(k, None)
-        urls.append(urlunparse((pu.scheme, pu.netloc, pu.path, pu.params, urlencode(q), pu.fragment)))
+        return urlunparse((pu.scheme, pu.netloc, pu.path, pu.params, urlencode(q), pu.fragment))
     except Exception:
-        urls.append(original_url)
+        return u
 
-    # 2) content_id / product_id から www 側 detail を推測
-    cid = (item.get("content_id") or item.get("product_id") or "").strip()
+
+def _extract_cid(u: str) -> str:
+    m = re.search(r"(?:cid|id)=([a-z0-9_]+)", u)
+    return m.group(1) if m else ""
+
+
+def _build_candidate_urls(item: dict, original_url: str) -> list[str]:
+    urls: list[str] = []
+    base = _strip_affiliate_params(original_url)
+    urls.append(base)
+
+    cid = (item.get("content_id") or item.get("product_id") or _extract_cid(base) or "").strip()
     if cid:
         urls.extend([
             f"https://www.dmm.co.jp/digital/videoa/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/digital/vrvideo/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/vrvideo/-/detail/=/cid={cid}/",
+            f"https://video.dmm.co.jp/av/content/?id={cid}",
         ])
 
-    # 3) www/video スワップ
-    extra = []
+    extra: list[str] = []
     for u in list(urls):
         try:
             pu = urlparse(u)
             if pu.netloc.startswith("video."):
                 extra.append(urlunparse((pu.scheme, "www." + pu.netloc.split(".",1)[1], pu.path, pu.params, pu.query, pu.fragment)))
             elif pu.netloc.startswith("www."):
-                # www→video 側のパス差分を一部ケア
                 extra.append(urlunparse((pu.scheme, "video." + pu.netloc.split(".",1)[1], pu.path.replace("/digital/", "/av/"), pu.params, pu.query, pu.fragment)))
         except Exception:
             pass
     urls.extend(extra)
 
-    # 4) 優先ドメイン指定
     if FORCE_DETAIL_DOMAIN in ("video", "www"):
         pref = "video." if FORCE_DETAIL_DOMAIN == "video" else "www."
         urls.sort(key=lambda x: 0 if urlparse(x).netloc.startswith(pref) else 1)
 
-    # 重複除去
     seen, out = set(), []
     for u in urls:
         if u not in seen:
@@ -256,7 +287,7 @@ def _build_candidate_urls(item, original_url: str):
 
 # ------------------ 説明文抽出（本文→メタ→JSONLD→フォールバック） ------------------
 
-def fetch_description_from_detail_page(url, item):
+def fetch_description_from_detail_page(url: str, item: dict) -> str:
     if not SCRAPE_DESC:
         return fallback_description(item)
 
@@ -272,73 +303,21 @@ def fetch_description_from_detail_page(url, item):
     if AGE_GATE_COOKIE:
         headers["Cookie"] = AGE_GATE_COOKIE
 
-    def pick_from_html(html_txt: str):
-        age_gate_markers = [
-            "18歳未満", "未満の方のアクセス", "成人向け", "アダルトサイト",
-            "under the age of 18", "age verification"
-        ]
-        if any(k in html_txt for k in age_gate_markers):
-            return None, "age-gate"
-
-        # 1) 本文ブロック
-        main_desc = extract_main_description(html_txt)
-        if main_desc and is_valid_description(main_desc):
-            return main_desc, "main"
-
-        # 2) og:description
-        m = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']', html_txt, re.I)
-        if m:
-            d = _clean_text(m.group(1))
-            if 30 <= len(d) <= 700 and is_valid_description(d):
-                return d, "og"
-
-        # 3) meta name=description
-        m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']', html_txt, re.I)
-        if m:
-            d = _clean_text(m.group(1))
-            if 30 <= len(d) <= 700 and is_valid_description(d):
-                return d, "meta"
-
-        # 4) JSON-LD
-        for m in re.finditer(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html_txt, re.S | re.I):
-            raw = m.group(1).strip()
-            try:
-                data = json.loads(raw)
-            except Exception:
-                continue
-            arr = data if isinstance(data, list) else [data]
-            for jd in arr:
-                if isinstance(jd, dict):
-                    if "description" in jd:
-                        d = _clean_text(str(jd["description"]))
-                        if 30 <= len(d) <= 700 and is_valid_description(d):
-                            return d, "jsonld"
-                    sub = jd.get("subjectOf")
-                    if isinstance(sub, dict) and "description" in sub:
-                        d = _clean_text(str(sub["description"]))
-                        if 30 <= len(d) <= 700 and is_valid_description(d):
-                            return d, "jsonld.subject"
-        return None, None
-
     last_err = None
-    for i, u in enumerate(_build_candidate_urls(item, url), 1):
+    candidates = _build_candidate_urls(item, url)
+
+    for i, u in enumerate(candidates, 1):
         try:
             resp = requests.get(u, headers=headers, timeout=12, allow_redirects=True)
-            html_bytes = resp.content  # ← 重要: bytesで受ける（文字化け回避）
-         try:
-    soup = BeautifulSoup(html_bytes, "lxml")
-except Exception:
-    soup = BeautifulSoup(html_bytes, "html.parser")
-html_txt = str(soup)  # 正規化したHTML文字列にして既存ロジックへ
-            desc, src = pick_from_html(html_txt)
-            if desc:
-                print(f"説明抽出: {src} / {u}")
+            html_bytes = resp.content  # ← 重要: bytesで受ける
+            desc = extract_main_description_from_html_bytes(html_bytes)
+            if desc and is_valid_description(desc):
+                print(f"説明抽出: OK / {u}")
                 return desc
-            if src == "age-gate":
-                print(f"年齢認証検知: {u} → 他候補 or フォールバック")
+            # 年齢認証/404/未検出の場合は次候補へ
         except Exception as e:
             last_err = e
-            print(f"説明抽出失敗({i}): {u} ({e})")
+            print(f"説明抽出失敗({i}/{len(candidates)}): {u} ({e})")
             time.sleep(0.2)
 
     if last_err:
@@ -347,14 +326,14 @@ html_txt = str(soup)  # 正規化したHTML文字列にして既存ロジック�
 
 # ------------------ VR判定・発売済み判定 ------------------
 
-def contains_vr(item) -> bool:
+def contains_vr(item: dict) -> bool:
     ii = item.get("iteminfo", {}) or {}
     names = [g.get("name", "") for g in ii.get("genre", []) if isinstance(g, dict)]
     joined = " ".join(names)
     return ("VR" in joined) or ("ＶＲ" in joined) or ("バーチャル" in joined)
 
 
-def is_released(item) -> bool:
+def is_released(item: dict) -> bool:
     ds = item.get("date")
     if not ds:
         return False
@@ -365,7 +344,7 @@ def is_released(item) -> bool:
 
 # ------------------ DMM API 呼び出し ------------------
 
-def dmm_request(params):
+def dmm_request(params: dict) -> dict:
     r = requests.get(DMM_API_URL, params=params, timeout=12)
     if r.status_code != 200:
         try:
@@ -382,12 +361,12 @@ def dmm_request(params):
     return res
 
 
-def fetch_all_vr_released_sorted():
+def fetch_all_vr_released_sorted() -> list[dict]:
     API_ID = get_env("DMM_API_ID")
     AFF_ID = get_env("DMM_AFFILIATE_ID")
-    all_items = []
+    all_items: list[dict] = []
 
-    def base_params(offset, use_keyword=True):
+    def base_params(offset: int, use_keyword: bool = True) -> dict:
         p = {
             "api_id": API_ID,
             "affiliate_id": AFF_ID,
@@ -429,7 +408,7 @@ def fetch_all_vr_released_sorted():
 
 # ------------------ 分割（直近/バックログ） ------------------
 
-def split_recent_and_backlog(items):
+def split_recent_and_backlog(items: list[dict]) -> tuple[list[dict], list[dict]]:
     boundary = now_jst() - timedelta(days=RECENT_DAYS)
     recent, backlog = [], []
     for it in items:
@@ -446,7 +425,7 @@ def split_recent_and_backlog(items):
 
 # ------------------ メディア/投稿 ------------------
 
-def upload_image(wp, url):
+def upload_image(wp: Client, url: str):
     try:
         data = requests.get(url, timeout=12).content
         name = os.path.basename(url.split("?")[0])
@@ -458,8 +437,8 @@ def upload_image(wp, url):
         return None
 
 
-def create_wp_post(item, wp, category, aff_id):
-    title = item["title"]
+def create_wp_post(item: dict, wp: Client, category: str, aff_id: str) -> bool:
+    title = item.get("title", "")
 
     # 既投稿チェック（タイトル一致）
     existing = wp.call(GetPosts({"post_status": "publish", "s": title}))
@@ -468,7 +447,7 @@ def create_wp_post(item, wp, category, aff_id):
         return False
 
     # 画像
-    images = []
+    images: list[str] = []
     siu = item.get("sampleImageURL", {}) or {}
     if "sample_l" in siu and "image" in siu["sample_l"]:
         images = siu["sample_l"]["image"]
@@ -480,7 +459,7 @@ def create_wp_post(item, wp, category, aff_id):
     thumb_id = upload_image(wp, images[0]) if images else None
 
     # タグ
-    tags = set()
+    tags: set[str] = set()
     ii = item.get("iteminfo", {}) or {}
     for key in ("label", "maker", "actress", "genre"):
         if key in ii and ii[key]:
@@ -491,7 +470,7 @@ def create_wp_post(item, wp, category, aff_id):
     aff_link = make_affiliate_link(item["URL"], aff_id)
     desc = fetch_description_from_detail_page(item["URL"], item)
 
-    parts = []
+    parts: list[str] = []
     parts.append(f'<p><a href="{aff_link}" target="_blank"><img src="{images[0]}" alt="{title}"></a></p>')
     parts.append(f'<p><a href="{aff_link}" target="_blank">{title}</a></p>')
     parts.append(f'<div>{desc}</div>')
