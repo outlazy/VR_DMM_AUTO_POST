@@ -2,17 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-FANZA（DMM）VR新着 → WordPress自動投稿（APIフロア横断・VR厳密判定・1ファイル完結）
+FANZA（DMM）VR新着 → WordPress自動投稿（APIフロア横断・VR超厳密判定・1ファイル完結）
 - DMM Affiliate API を floor=videoa / videoc で横断取得
-- VR厳密判定（タイトルに「VR」/ URL media_type=vr / CIDに vr+数字）
-- 通常動画は除外、VR作品のみ投稿
+- VR厳密判定：
+    1) URLが media_type=vr または /vrvideo/ を含む → True
+    2) CIDが *vrNN / dsvrNN などVRパターン → True
+    3) 上記以外は「タイトルにVR」かつ「ジャンル名にVR系語彙（VR専用/8KVR等）」のときのみ True
+  => タイトルだけの“なんちゃってVR”は除外（例：Avril／VR絶頂など）
 """
 
 import os, re, time, html, json, pytz, requests
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
-# ====== ★互換パッチ（collections.Iterable 等）← 最優先で定義 ======
+# ====== collections.Iterable 互換パッチ（wordpress_xmlrpc 対策） ======
 import collections as _col
 import collections.abc as _abc
 for _n in ("Iterable", "Mapping", "MutableMapping", "Sequence"):
@@ -31,9 +34,9 @@ POST_LIMIT = int(os.getenv("POST_LIMIT", "2"))
 RECENT_DAYS = int(os.getenv("RECENT_DAYS", "3"))
 HITS = int(os.getenv("HITS", "30"))
 MAX_PAGES = int(os.getenv("MAX_PAGES", "6"))
-FLOORS = os.getenv("FLOORS", "videoa,videoc").split(",")  # 例: "videoa,videoc"
-REQUIRE_RELEASED = int(os.getenv("REQUIRE_RELEASED", "1"))       # 1=発売済のみ
-RELEASE_GRACE_HOURS = int(os.getenv("RELEASE_GRACE_HOURS", "36"))# 発売直前の猶予
+FLOORS = os.getenv("FLOORS", "videoa,videoc").split(",")
+REQUIRE_RELEASED = int(os.getenv("REQUIRE_RELEASED", "1"))
+RELEASE_GRACE_HOURS = int(os.getenv("RELEASE_GRACE_HOURS", "36"))
 
 # ------------------ ユーティリティ ------------------
 def now_jst():
@@ -61,35 +64,51 @@ def make_affiliate_link(url: str, aff_id: str) -> str:
     q["affiliate_id"] = aff_id
     return urlunparse((pu.scheme, pu.netloc, pu.path, pu.params, urlencode(q), pu.fragment))
 
-# ------------------ VR判定・発売済み判定 ------------------
+# ------------------ VR判定・発売済み判定（超厳密） ------------------
+def _has_vr_token_in_title(title: str) -> bool:
+    # 「VR」が前後英数字に接していない（Avril対策）
+    return bool(re.search(r"(?<![A-Za-z0-9])VR(?![A-Za-z0-9])", title or "")) or any(
+        kw in (title or "") for kw in ["【VR】", "VR専用", "8K VR", "8KVR", "ハイクオリティVR"]
+    )
+
+def _genre_has_vr_words(iteminfo: dict) -> bool:
+    names = [x.get("name","") for x in (iteminfo or {}).get("genre",[]) if isinstance(x,dict)]
+    joined = " ".join(names)
+    vr_words = ["VR", "ＶＲ", "VR専用", "8KVR", "8K VR", "ハイクオリティVR", "VR動画", "VR作品"]
+    return any(re.search(rf"(?<![A-Za-z0-9]){re.escape(w)}(?![A-Za-z0-9])", joined) for w in vr_words)
+
 def contains_vr(item: dict) -> bool:
     """
-    VR厳密判定（タイトルに「VR」/ URLにmedia_type=vr / VR系CID）
+    超厳密VR判定：
+      A) URL: media_type=vr or /vrvideo/ → True
+      B) CID: *vr + 数字（2桁以上） or dsvr + 数字 → True
+      C) タイトルにVRトークン かつ ジャンルにVR語彙 → True
+      それ以外は False
     """
-    # URLチェック
+    # A) URLで判定
     try:
         u = item.get("URL", "")
         pu = urlparse(u)
         q = dict(parse_qsl(pu.query))
-        if q.get("media_type", "").lower() == "vr":
+        if q.get("media_type","").lower() == "vr":
             return True
         if "/vrvideo/" in pu.path:
             return True
     except Exception:
         pass
 
-    # content_id パターン（dsvr, idvr, *vr + 数字）
+    # B) CIDで判定
     cid = (item.get("content_id") or item.get("product_id") or "").lower()
     if re.search(r"(?:^|[^a-z])(dsvr|idvr|[a-z]*vr)\d{2,}", cid):
         return True
 
-    # タイトルに「VR」がトークンとして出現（Avril対策：前後が英数字でない）
-    title = (item.get("title") or "")
-    if re.search(r"(?<![A-Za-z0-9])VR(?![A-Za-z0-9])", title):
-        return True
-    if any(k in title for k in ["【VR】", "VR専用", "8K VR", "8KVR", "ハイクオリティVR"]):
+    # C) タイトル + ジャンル
+    title_ok = _has_vr_token_in_title(item.get("title",""))
+    genre_ok = _genre_has_vr_words(item.get("iteminfo",{}) or {})
+    if title_ok and genre_ok:
         return True
 
+    # ここまで来たら非VR
     return False
 
 def is_released(item: dict) -> bool:
@@ -146,12 +165,13 @@ def fetch_vr_items_from_floors() -> list[dict]:
             time.sleep(0.2)
 
     vr_items = [it for it in raw if contains_vr(it)]
+    unreleased = [it for it in vr_items if not is_released(it)]
     released = [it for it in vr_items if is_released(it)]
-    print(f"[API] 総取得: {len(raw)} / VR判定: {len(vr_items)} / 発売OK: {len(released)}")
+    print(f"[API] 総取得: {len(raw)} / VR判定: {len(vr_items)} / 未発売: {len(unreleased)} / 発売OK: {len(released)}")
     released.sort(key=lambda x: x.get("date", ""), reverse=True)
     return released
 
-# ------------------ 本文生成（フォールバック） ------------------
+# ------------------ 本文フォールバック ------------------
 def fallback_description(item: dict) -> str:
     ii = item.get("iteminfo", {}) or {}
     for key in ("description","comment","story"):
@@ -194,7 +214,6 @@ def create_wp_post(item: dict, wp: Client, category: str, aff_id: str) -> bool:
             print(f"→ 既投稿: {title}")
             return False
     except Exception as e:
-        # 検索失敗は致命ではないので続行
         print(f"[既投稿チェック失敗] {e}")
 
     siu = item.get("sampleImageURL") or {}
@@ -227,7 +246,7 @@ def create_wp_post(item: dict, wp: Client, category: str, aff_id: str) -> bool:
 
 # ------------------ メイン ------------------
 def main():
-    print(f"[{now_jst()}] VR新着投稿開始（VRタイトル限定）")
+    print(f"[{now_jst()}] VR新着投稿開始（VRタイトル+ジャンル連動/URL/CIDの超厳密判定）")
     wp = Client(get_env("WP_URL"), get_env("WP_USER"), get_env("WP_PASS"))
     cat = get_env("CATEGORY")
     aff = get_env("DMM_AFFILIATE_ID")
