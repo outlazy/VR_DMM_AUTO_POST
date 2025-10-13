@@ -2,17 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-FANZA（DMM）VR新着 → WordPress自動投稿（APIフロア横断版・1ファイル完結）
+FANZA（DMM）VR新着 → WordPress自動投稿（APIフロア横断・発売判定ゆるめ版／1ファイル完結）
 - スクレイピング不使用。DMM Affiliate APIを floor=videoa / videoc で横断取得
-- VR判定を多面的に強化（content_id/URL/ジャンル/タイトル）
-- 発売済みのみ（日付<=現在JST）を日付降順で整列、直近優先で最大POST_LIMIT件投稿
+- VR判定を多面的に強化（CID/URL/タイトル/ジャンル/シリーズ/メーカー）
+- 発売判定は環境変数で調整: REQUIRE_RELEASED(1/0), RELEASE_GRACE_HOURS(既定36h)
+- 直近優先: RECENT_DAYS（既定3）→ 不足分をバックログからPOST_LIMIT件まで投稿
 """
 
-import os, re, time, json, html, pytz, requests
+import os, re, time, html, json, pytz, requests
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
-# 古い依存が collections.Iterable を参照する対策
+# 依存が collections.Iterable を参照する対策
 import collections as _collections, collections.abc as _abc
 for _n in ("Iterable","Mapping","MutableMapping","Sequence"):
     if not hasattr(_collections,_n) and hasattr(_abc,_n):
@@ -23,13 +24,15 @@ from wordpress_xmlrpc.methods import posts, media
 from wordpress_xmlrpc.methods.posts import GetPosts
 from wordpress_xmlrpc.compat import xmlrpc_client
 
-# ------------- 環境変数 -------------
-DMM_API_URL = "https://api.dmm.com/affiliate/v3/ItemList"
-POST_LIMIT  = int(os.getenv("POST_LIMIT", "2"))
-RECENT_DAYS = int(os.getenv("RECENT_DAYS", "3"))
-HITS        = int(os.getenv("HITS", "30"))      # API 1ページ件数（最大30）
-MAX_PAGES   = int(os.getenv("MAX_PAGES", "6"))  # 取得ページ数
-FLOORS      = os.getenv("FLOORS", "videoa,videoc").split(",")
+# ------------- 設定 -------------
+DMM_API_URL    = "https://api.dmm.com/affiliate/v3/ItemList"
+POST_LIMIT     = int(os.getenv("POST_LIMIT", "2"))
+RECENT_DAYS    = int(os.getenv("RECENT_DAYS", "3"))
+HITS           = int(os.getenv("HITS", "30"))      # API 1ページ件数（最大30）
+MAX_PAGES      = int(os.getenv("MAX_PAGES", "6"))  # 取得ページ数
+FLOORS         = os.getenv("FLOORS", "videoa,videoc").split(",")
+REQUIRE_RELEASED = int(os.getenv("REQUIRE_RELEASED", "1"))  # 1=発売済のみ, 0=発売前もOK
+RELEASE_GRACE_HOURS = int(os.getenv("RELEASE_GRACE_HOURS", "36"))  # 発売直前の猶予時間
 
 # ------------- ユーティリティ -------------
 def now_jst():
@@ -62,31 +65,33 @@ def make_affiliate_link(url: str, aff_id: str) -> str:
 
 # ------------- VR判定＆発売済み -------------
 def contains_vr(item: dict) -> bool:
-    # 1) content_id に 'vr' っぽいパターン（例: 13dsvr01821）
+    # content_id に 'vr'
     cid = (item.get("content_id") or item.get("product_id") or "").lower()
-    if re.search(r"vr", cid):
-        return True
-    # 2) URL に /vr/ や media_type=vr が含まれる
+    if re.search(r"vr", cid): return True
+    # URL に /vr/ or media_type=vr
     u = (item.get("URL") or "").lower()
-    if "/vr/" in u or "media_type=vr" in u:
-        return True
-    # 3) ジャンルに VR 系ワード
+    if "/vr/" in u or "media_type=vr" in u: return True
+    # タイトルに VR
+    if "vr" in (item.get("title","") or "").lower(): return True
+    # ジャンル・シリーズ・メーカー名
     ii = item.get("iteminfo", {}) or {}
-    names = [g.get("name","") for g in ii.get("genre",[]) if isinstance(g,dict)]
-    joined = " ".join(names)
-    for k in ("VR","ＶＲ","バーチャル","8K VR","VR専用","ハイクオリティVR"):
-        if k in joined:
+    def names(key): return [x.get("name","") for x in ii.get(key,[]) if isinstance(x,dict)]
+    text = " ".join(names("genre") + names("series") + names("maker") + names("label"))
+    for k in ("VR","ＶＲ","バーチャル","8K VR","VR専用","ハイクオリティVR","8KVR","VR動画"):
+        if k.lower() in text.lower():
             return True
-    # 4) タイトルに VR
-    if "VR" in (item.get("title","") or ""):
-        return True
     return False
 
 def is_released(item: dict) -> bool:
+    # 発売日の36時間前（既定）までは「OK」とみなす設定を入れて救う
+    if not REQUIRE_RELEASED:
+        return True
     ds = item.get("date")
     if not ds: return False
     try:
-        return parse_jst_date(ds) <= now_jst()
+        d = parse_jst_date(ds)
+        grace = d - timedelta(hours=RELEASE_GRACE_HOURS)
+        return grace <= now_jst()
     except Exception:
         return False
 
@@ -102,7 +107,7 @@ def dmm_request(params: dict) -> dict:
     return data.get("result", {}) or {}
 
 def base_params(offset: int, floor: str, use_keyword=True) -> dict:
-    return {
+    base = {
         "api_id":       get_env("DMM_API_ID"),
         "affiliate_id": get_env("DMM_AFFILIATE_ID"),
         "site":   "FANZA",
@@ -111,13 +116,16 @@ def base_params(offset: int, floor: str, use_keyword=True) -> dict:
         "sort":   "date",
         "output": "json",
         "hits":   HITS,
-        "offset": offset,    # ※ DMMは 1 起点
-        **({"keyword":"VR"} if use_keyword else {}),
+        "offset": offset,    # DMMは1起点
     }
+    if use_keyword:
+        # キーワードにVRを入れて一次絞り込み（ノイズ軽減）
+        base["keyword"] = "VR"
+    return base
 
 def fetch_vr_items_from_floors() -> list[dict]:
     print("[API] フロア横断取得開始 →", ",".join(FLOORS))
-    got = []
+    raw = []
     for floor in FLOORS:
         for page in range(MAX_PAGES):
             offset = 1 + page*HITS
@@ -136,27 +144,33 @@ def fetch_vr_items_from_floors() -> list[dict]:
             print(f"[API] 取得 {len(items)} 件")
             if not items:
                 break
-            got.extend(items)
+            raw.extend(items)
             time.sleep(0.2)
 
-    # VRだけ抽出＋発売済み
-    filtered = [it for it in got if contains_vr(it) and is_released(it)]
-    filtered.sort(key=lambda x: x.get("date",""), reverse=True)
-    print(f"[API] VR発売済み件数: {len(filtered)}（日付降順）")
-    return filtered
+    # 内訳ログ
+    vr_hit = [it for it in raw if contains_vr(it)]
+    unreleased = [it for it in vr_hit if not is_released(it)]
+    released   = [it for it in vr_hit if is_released(it)]
+    print(f"[API] 総取得: {len(raw)} / VR判定: {len(vr_hit)} / 未発売: {len(unreleased)} / 発売OK: {len(released)}")
 
-# ------------- 本文（説明）フォールバック -------------
+    released.sort(key=lambda x: x.get("date",""), reverse=True)
+    return released
+
+# ------------- 本文フォールバック（API情報から生成） -------------
 def fallback_description(item: dict) -> str:
     ii = item.get("iteminfo", {}) or {}
     for key in ("description","comment","story"):
         v = (item.get(key) or ii.get(key) or "").strip()
-        if 20 <= len(v) <= 800: return html.unescape(v)
+        if 20 <= len(v) <= 800:
+            return html.unescape(v)
     cast  = "、".join([a.get("name","") for a in ii.get("actress",[]) if isinstance(a,dict)])
     label = "、".join([l.get("name","") for l in ii.get("label",[])   if isinstance(l,dict)])
     genres= "、".join([g.get("name","") for g in ii.get("genre",[])   if isinstance(g,dict)])
+    series= "、".join([s.get("name","") for s in ii.get("series",[])  if isinstance(s,dict)])
+    maker = "、".join([m.get("name","") for m in ii.get("maker",[])   if isinstance(m,dict)])
     title = item.get("title","")
     vol   = item.get("volume","")
-    base  = f"{title}。ジャンル：{genres}。出演：{cast}。レーベル：{label}。収録時間：{vol}。"
+    base  = f"{title}。ジャンル：{genres}。出演：{cast}。シリーズ：{series}。メーカー：{maker}。レーベル：{label}。収録時間：{vol}。"
     return base if len(base) > 10 else "FANZA（DMM）VR作品の自動紹介です。"
 
 # ------------- WordPress 投稿 -------------
@@ -221,12 +235,13 @@ def create_wp_post(item: dict, wp: Client, category: str, aff_id: str) -> bool:
 
 # ------------- メイン -------------
 def main():
-    print(f"[{now_jst()}] VR新着投稿開始（APIフロア横断）")
+    print(f"[{now_jst()}] VR新着投稿開始（APIフロア横断＋発売判定ゆるめ）")
     wp  = Client(get_env("WP_URL"), get_env("WP_USER"), get_env("WP_PASS"))
     cat = get_env("CATEGORY")
     aff = get_env("DMM_AFFILIATE_ID")
 
     items = fetch_vr_items_from_floors()
+
     # 直近優先
     boundary = now_jst() - timedelta(days=RECENT_DAYS)
     recent, backlog = [], []
