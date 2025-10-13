@@ -357,6 +357,54 @@ def dmm_request(params: dict) -> dict:
         raise RuntimeError(f"DMM API NG: {msg}")
     return res
 
+# ===== APIフォールバック（一覧が拾えない時に使用） =====
+HITS_API   = int(os.environ.get("HITS", "30"))
+MAX_PAGES_API = int(os.environ.get("MAX_PAGES", "6"))
+
+def _base_api_params(offset: int, use_keyword: bool = True) -> dict:
+    API_ID = get_env("DMM_API_ID")
+    AFF_ID = get_env("DMM_AFFILIATE_ID")
+    p = {
+        "api_id": API_ID,
+        "affiliate_id": AFF_ID,
+        "site": "FANZA",
+        "service": "digital",
+        "floor": "videoa",
+        "sort": "date",
+        "output": "json",
+        "hits": HITS_API,
+        "offset": offset,
+    }
+    if use_keyword:
+        p["keyword"] = "VR"
+    return p
+
+
+def fetch_all_vr_released_sorted_api() -> list[dict]:
+    all_items: list[dict] = []
+    for page in range(MAX_PAGES_API):
+        offset = 1 + page * HITS_API
+        print(f"[API] page {page+1} fetch (offset={offset}) with keyword=VR")
+        try:
+            res = dmm_request(_base_api_params(offset, use_keyword=True))
+            items = res.get("items", []) or []
+        except Exception as e:
+            print(f"[API] keyword=VR で失敗: {e} → keywordなしで再試行")
+            try:
+                res = dmm_request(_base_api_params(offset, use_keyword=False))
+                items = res.get("items", []) or []
+            except Exception as e2:
+                print(f"[API] keywordなしでも失敗: {e2} → 打ち切り")
+                break
+        print(f"[API] 取得件数: {len(items)}")
+        if not items:
+            break
+        all_items.extend(items)
+    released = [it for it in all_items if contains_vr(it) and is_released(it)]
+    released.sort(key=lambda x: x.get('date', ''), reverse=True)
+    print(f"[API] VR発売済み件数: {len(released)}（日付降順）")
+    return released
+
 
 def fetch_item_by_cid(cid: str) -> dict | None:
     API_ID = get_env("DMM_API_ID")
@@ -464,6 +512,9 @@ def scrape_vr_cids(max_pages: int = VR_LIST_PAGES) -> list[str]:
 def fetch_released_from_vr_list() -> list[dict]:
     print(f"VR一覧スクレイプ開始（pages={VR_LIST_PAGES}）")
     cids = scrape_vr_cids(VR_LIST_PAGES)
+    if not cids:
+        print("一覧からCIDが取得できなかったため、APIフォールバックに切替（videoa/date）")
+        return fetch_all_vr_released_sorted_api()
     items: list[dict] = []
     for i, cid in enumerate(cids, 1):
         it = fetch_item_by_cid(cid)
