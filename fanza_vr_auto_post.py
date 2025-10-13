@@ -2,21 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-FANZA（DMM）VR新着 → WordPress自動投稿（本文抽出・Cookie対応・www優先・404除外）
+FANZA（DMM）VR新着 → WordPress自動投稿
+取得元を **/av/list/?media_type=vr&sort=date** の一覧スクレイプに切替（APIは補完に使用）
+- VR一覧ページから CID を抽出 → CIDごとに DMM API で詳細取得 → 発売済のみを日付降順
+- 年齢ゲート対策で Cookie を送信（任意）
+- 説明文抽出は www 優先・404除外の既存ロジックを継承
 
-ポイント（今回の修正）
-- `FORCE_DETAIL_DOMAIN` の既定を `www` に。`video` 側で404を踏むケース（savr系など）を回避
-- 候補URLに `https://www.dmm.co.jp/av/-/detail/=/cid=.../` と `https://www.dmm.co.jp/mono/dvd/-/detail/=/cid=.../` を追加
-- 詳細取得時に **HTTP 404** を検知したら即座に次候補へ（テキスト判定前にスキップ）
-- レスポンスは **bytes→BeautifulSoup** でパースし、文字化けやmeta不一致を吸収
-- 年齢認証ページは検知してフォールバック（回避はしない）
-
-必要 Secrets/Env
+必要 Secrets/Env（従来と同じ）
   WP_URL / WP_USER / WP_PASS / DMM_API_ID / DMM_AFFILIATE_ID / CATEGORY
 任意 Env
-  POST_LIMIT=2 / RECENT_DAYS=3 / MAX_PAGES=6 / HITS=30 / SCRAPE_DESC=1
-  AGE_GATE_COOKIE="ckcy=1; age_check_done=1"（自分の年齢同意Cookie）
-  FORCE_DETAIL_DOMAIN=www（www優先。videoにしたいときだけ変更）
+  POST_LIMIT=2 / RECENT_DAYS=3 / VR_LIST_PAGES=3 / SCRAPE_DESC=1
+  AGE_GATE_COOKIE="ckcy=1; age_check_done=1"
+  FORCE_DETAIL_DOMAIN=www
 """
 
 import os
@@ -51,15 +48,14 @@ except Exception:
 DMM_API_URL = "https://api.dmm.com/affiliate/v3/ItemList"
 
 # ===== 可変パラメータ（envで上書き可） =====
-MAX_PAGES   = int(os.environ.get("MAX_PAGES", "6"))   # 探索最大ページ数（1ページ=HITS件）
-HITS        = int(os.environ.get("HITS", "30"))       # 1ページ取得件数
-POST_LIMIT  = int(os.environ.get("POST_LIMIT", "2"))  # 1回の実行で投稿する最大件数
-RECENT_DAYS = int(os.environ.get("RECENT_DAYS", "3")) # 直近何日を“新作”とみなすか
-SCRAPE_DESC = os.environ.get("SCRAPE_DESC", "1") == "1"  # 1=本文抽出有効
-AGE_GATE_COOKIE = os.environ.get("AGE_GATE_COOKIE", "").strip()  # 例: "ckcy=1; age_check_done=1"
-FORCE_DETAIL_DOMAIN = os.environ.get("FORCE_DETAIL_DOMAIN", "www").strip()  # 既定を www
-# =========================================
+POST_LIMIT       = int(os.environ.get("POST_LIMIT", "2"))   # 1回の実行で投稿する最大件数
+RECENT_DAYS      = int(os.environ.get("RECENT_DAYS", "3"))   # 直近何日を“新作”とみなすか
+VR_LIST_PAGES    = int(os.environ.get("VR_LIST_PAGES", "3")) # VR一覧ページの巡回ページ数
+SCRAPE_DESC      = os.environ.get("SCRAPE_DESC", "1") == "1"  # 1=本文抽出有効
+AGE_GATE_COOKIE  = os.environ.get("AGE_GATE_COOKIE", "").strip()
+FORCE_DETAIL_DOMAIN = os.environ.get("FORCE_DETAIL_DOMAIN", "www").strip()
 
+# =========================================
 NG_DESCRIPTIONS = [
     "From here on, it will be an adult site",
     "18歳未満", "未成年", "18才未満",
@@ -105,7 +101,7 @@ def is_valid_description(desc: str) -> bool:
             return False
     return True
 
-# ------------------ フォールバック（API/自動生成） ------------------
+# ------------------ 代替本文（API/自動生成） ------------------
 
 def fallback_description(item: dict) -> str:
     ii = item.get("iteminfo", {}) or {}
@@ -121,7 +117,7 @@ def fallback_description(item: dict) -> str:
     base = f"{title}。ジャンル：{genres}。出演：{cast}。レーベル：{label}。収録時間：{volume}。"
     return base if len(base) > 10 else "FANZA（DMM）VR動画の自動投稿です。"
 
-# ------------------ 本文抽出（セレクタ強化＋bytes→Soup） ------------------
+# ------------------ 本文抽出（www優先／404除外） ------------------
 
 def _clean_text(s: str) -> str:
     s = html.unescape(s or "").strip()
@@ -142,14 +138,11 @@ def extract_main_description_from_html_bytes(html_bytes: bytes) -> str | None:
     except Exception:
         return None
 
-    # 年齢認証/404っぽい判定（軽量）
     raw_text = soup.get_text(" ", strip=True)
     if any(k in raw_text for k in AGE_MARKERS):
         return None
 
     candidates: list[str] = []
-
-    # 1) DMMでよく見る本文ブロック
     for sel in [
         "div.mg-b20.lh4",
         "div#introduction", "section#introduction", "div.introduction", "section.introduction",
@@ -162,7 +155,6 @@ def extract_main_description_from_html_bytes(html_bytes: bytes) -> str | None:
             if t:
                 candidates.append(t)
 
-    # 2) 見出し→直後の段落群
     for h in soup.find_all(["h1", "h2", "h3", "h4"]):
         ht = (h.get_text(strip=True) or "")
         if any(k in ht for k in ["作品紹介", "作品内容", "ストーリー", "あらすじ", "解説"]):
@@ -177,7 +169,6 @@ def extract_main_description_from_html_bytes(html_bytes: bytes) -> str | None:
             if parts:
                 candidates.append("\n".join(parts))
 
-    # 3) 長めの段落（保険）
     for p in soup.find_all("p"):
         t = p.get_text(" ", strip=True)
         if t and len(t) >= 60:
@@ -205,7 +196,6 @@ def extract_main_description_from_html_bytes(html_bytes: bytes) -> str | None:
     if best:
         return best
 
-    # 4) og:description / meta description / JSON-LD
     m = soup.select_one('meta[property="og:description"]')
     if m and m.get("content"):
         d = _clean_text(m["content"])
@@ -261,8 +251,8 @@ def _build_candidate_urls(item: dict, original_url: str) -> list[str]:
             f"https://www.dmm.co.jp/digital/videoa/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/digital/vrvideo/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/vrvideo/-/detail/=/cid={cid}/",
-            f"https://www.dmm.co.jp/av/-/detail/=/cid={cid}/",       # 追加
-            f"https://www.dmm.co.jp/mono/dvd/-/detail/=/cid={cid}/", # 追加（保険）
+            f"https://www.dmm.co.jp/av/-/detail/=/cid={cid}/",
+            f"https://www.dmm.co.jp/mono/dvd/-/detail/=/cid={cid}/",
             f"https://video.dmm.co.jp/av/content/?id={cid}",
         ])
 
@@ -313,16 +303,14 @@ def fetch_description_from_detail_page(url: str, item: dict) -> str:
     for i, u in enumerate(candidates, 1):
         try:
             resp = requests.get(u, headers=headers, timeout=12, allow_redirects=True)
-            # 404 は即スキップ（video側で多発するため）
             if resp.status_code == 404:
                 print(f"説明抽出: 404 / {u}")
                 continue
-            html_bytes = resp.content  # bytesで受ける
+            html_bytes = resp.content
             desc = extract_main_description_from_html_bytes(html_bytes)
             if desc and is_valid_description(desc):
                 print(f"説明抽出: OK / {u}")
                 return desc
-            # 年齢認証/未検出の場合は次候補へ
         except Exception as e:
             last_err = e
             print(f"説明抽出失敗({i}/{len(candidates)}): {u} ({e})")
@@ -338,7 +326,8 @@ def contains_vr(item: dict) -> bool:
     ii = item.get("iteminfo", {}) or {}
     names = [g.get("name", "") for g in ii.get("genre", []) if isinstance(g, dict)]
     joined = " ".join(names)
-    return ("VR" in joined) or ("ＶＲ" in joined) or ("バーチャル" in joined)
+    keys = ["VR", "ＶＲ", "バーチャル", "8K VR", "VR専用", "ハイクオリティVR"]
+    return any(k in joined for k in keys)
 
 
 def is_released(item: dict) -> bool:
@@ -369,55 +358,95 @@ def dmm_request(params: dict) -> dict:
     return res
 
 
-def fetch_all_vr_released_sorted() -> list[dict]:
+def fetch_item_by_cid(cid: str) -> dict | None:
     API_ID = get_env("DMM_API_ID")
     AFF_ID = get_env("DMM_AFFILIATE_ID")
-    all_items: list[dict] = []
+    params = {
+        "api_id": API_ID,
+        "affiliate_id": AFF_ID,
+        "site": "FANZA",
+        "service": "digital",
+        "floor": "videoa",
+        "sort": "date",
+        "hits": 1,
+        "offset": 1,
+        "cid": cid,
+        "output": "json",
+    }
+    try:
+        res = dmm_request(params)
+        items = res.get("items") or []
+        return items[0] if items else None
+    except Exception as e:
+        print(f"CID={cid} のAPI取得失敗: {e}")
+        return None
 
-    def base_params(offset: int, use_keyword: bool = True) -> dict:
-        p = {
-            "api_id": API_ID,
-            "affiliate_id": AFF_ID,
-            "site": "FANZA",
-            "service": "digital",
-            "floor": "videoa",   # VR単品
-            "sort": "date",
-            "output": "json",
-            "hits": HITS,
-            "offset": offset,    # 1, 1+HITS, ...
-        }
-        if use_keyword:
-            p["keyword"] = "VR"
-        return p
+# ------------------ VR一覧スクレイプ ------------------
 
-    for page in range(MAX_PAGES):
-        offset = 1 + page * HITS
-        print(f"[page {page+1}] fetch (offset={offset}) with keyword=VR")
+def scrape_vr_cids(max_pages: int = VR_LIST_PAGES) -> list[str]:
+    """https://video.dmm.co.jp/av/list/?media_type=vr&sort=date からCIDを抽出"""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    }
+    if AGE_GATE_COOKIE:
+        headers["Cookie"] = AGE_GATE_COOKIE
+
+    base = "https://video.dmm.co.jp/av/list/?media_type=vr&sort=date"
+    found: list[str] = []
+    pat = re.compile(r"(?:content/\?id=|cid=)([a-z0-9_]+)", re.I)
+
+    for p in range(1, max_pages + 1):
+        url = base + (f"&page={p}" if p > 1 else "")
         try:
-            res = dmm_request(base_params(offset, use_keyword=True))
-            items = res.get("items", []) or []
-        except Exception as e:
-            print(f"keyword=VR で失敗: {e} → keywordなしで再試行")
-            try:
-                res = dmm_request(base_params(offset, use_keyword=False))
-                items = res.get("items", []) or []
-            except Exception as e2:
-                print(f"keywordなしでも失敗: {e2} → これ以上このページは進めません")
+            r = requests.get(url, headers=headers, timeout=12)
+            if r.status_code != 200:
+                print(f"VR一覧取得失敗: {r.status_code} {url}")
                 break
-        print(f"取得件数: {len(items)}")
-        if not items:
+            html_txt = r.text
+            cids = pat.findall(html_txt)
+            if not cids:
+                print(f"CIDが見つかりません: {url}")
+            found.extend(cids)
+            print(f"[VR一覧] page {p}: CID {len(cids)}件")
+        except Exception as e:
+            print(f"VR一覧取得エラー: {e}")
             break
-        all_items.extend(items)
+        time.sleep(0.2)
 
-    released = [it for it in all_items if contains_vr(it) and is_released(it)]
+    # 重複排除（上位=新しい方を優先）
+    seen, out = set(), []
+    for cid in found:
+        if cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+
+def fetch_released_from_vr_list() -> list[dict]:
+    print(f"VR一覧スクレイプ開始（pages={VR_LIST_PAGES}）")
+    cids = scrape_vr_cids(VR_LIST_PAGES)
+    items: list[dict] = []
+    for i, cid in enumerate(cids, 1):
+        it = fetch_item_by_cid(cid)
+        if it:
+            items.append(it)
+        if i % 10 == 0:
+            time.sleep(0.3)
+    # 発売済み＆VR判定
+    released = [it for it in items if contains_vr(it) and is_released(it)]
     released.sort(key=lambda x: x.get('date', ''), reverse=True)
-    print(f"VR発売済み件数: {len(released)}（日付降順）")
+    print(f"VR発売済み件数: {len(released)}（一覧→API補完／日付降順）")
     return released
 
 # ------------------ 分割（直近/バックログ） ------------------
 
-def split_recent_and_backlog(items: list[dict]) -> tuple[list[dict], list[dict]]:
-    boundary = now_jst() - timedelta(days=RECENT_DAYS)
+def split_recent_and_backlog(items: list[dict], recent_days: int = RECENT_DAYS) -> tuple[list[dict], list[dict]]:
+    boundary = now_jst() - timedelta(days=recent_days)
     recent, backlog = [], []
     for it in items:
         try:
@@ -502,7 +531,7 @@ def create_wp_post(item: dict, wp: Client, category: str, aff_id: str) -> bool:
 
 def main():
     jst_now = now_jst()
-    print(f"[{jst_now.strftime('%Y-%m-%d %H:%M:%S')}] VR新着投稿開始（www優先／直近{RECENT_DAYS}日→バックログ／SCRAPE_DESC={'ON' if SCRAPE_DESC else 'OFF'}）")
+    print(f"[{jst_now.strftime('%Y-%m-%d %H:%M:%S')}] VR新着投稿開始（一覧スクレイプ→API補完／直近{RECENT_DAYS}日優先）")
     try:
         WP_URL = get_env('WP_URL').strip()
         WP_USER = get_env('WP_USER')
@@ -511,8 +540,8 @@ def main():
         AFF_ID = get_env('DMM_AFFILIATE_ID')
         wp = Client(WP_URL, WP_USER, WP_PASS)
 
-        all_released = fetch_all_vr_released_sorted()
-        recent, backlog = split_recent_and_backlog(all_released)
+        all_released = fetch_released_from_vr_list()
+        recent, backlog = split_recent_and_backlog(all_released, RECENT_DAYS)
         print(f"直近{RECENT_DAYS}日: {len(recent)} / バックログ: {len(backlog)}")
 
         posted = 0
