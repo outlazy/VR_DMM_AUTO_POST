@@ -4,13 +4,20 @@
 """
 FANZA（DMM）VR新着 → WordPress自動投稿（APIフロア横断・VR厳密判定・1ファイル完結）
 - DMM Affiliate API を floor=videoa / videoc で横断取得
-- VR厳密判定（タイトルに「VR」が付く / URL media_type=vr / CIDにvrを含む）
-- 通常動画を除外、VR作品のみ投稿
+- VR厳密判定（タイトルに「VR」/ URL media_type=vr / CIDに vr+数字）
+- 通常動画は除外、VR作品のみ投稿
 """
 
 import os, re, time, html, json, pytz, requests
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
+# ====== ★互換パッチ（collections.Iterable 等）← 最優先で定義 ======
+import collections as _col
+import collections.abc as _abc
+for _n in ("Iterable", "Mapping", "MutableMapping", "Sequence"):
+    if not hasattr(_col, _n) and hasattr(_abc, _n):
+        setattr(_col, _n, getattr(_abc, _n))
 
 # WordPress XMLRPC
 from wordpress_xmlrpc import Client, WordPressPost
@@ -24,9 +31,9 @@ POST_LIMIT = int(os.getenv("POST_LIMIT", "2"))
 RECENT_DAYS = int(os.getenv("RECENT_DAYS", "3"))
 HITS = int(os.getenv("HITS", "30"))
 MAX_PAGES = int(os.getenv("MAX_PAGES", "6"))
-FLOORS = os.getenv("FLOORS", "videoa,videoc").split(",")
-REQUIRE_RELEASED = int(os.getenv("REQUIRE_RELEASED", "1"))
-RELEASE_GRACE_HOURS = int(os.getenv("RELEASE_GRACE_HOURS", "36"))
+FLOORS = os.getenv("FLOORS", "videoa,videoc").split(",")  # 例: "videoa,videoc"
+REQUIRE_RELEASED = int(os.getenv("REQUIRE_RELEASED", "1"))       # 1=発売済のみ
+RELEASE_GRACE_HOURS = int(os.getenv("RELEASE_GRACE_HOURS", "36"))# 発売直前の猶予
 
 # ------------------ ユーティリティ ------------------
 def now_jst():
@@ -57,7 +64,7 @@ def make_affiliate_link(url: str, aff_id: str) -> str:
 # ------------------ VR判定・発売済み判定 ------------------
 def contains_vr(item: dict) -> bool:
     """
-    VR厳密判定（タイトルに「VR」が付く / URLにmedia_type=vr / VR系CID）
+    VR厳密判定（タイトルに「VR」/ URLにmedia_type=vr / VR系CID）
     """
     # URLチェック
     try:
@@ -71,12 +78,12 @@ def contains_vr(item: dict) -> bool:
     except Exception:
         pass
 
-    # content_id パターン（dsvr, idvr 等）
+    # content_id パターン（dsvr, idvr, *vr + 数字）
     cid = (item.get("content_id") or item.get("product_id") or "").lower()
     if re.search(r"(?:^|[^a-z])(dsvr|idvr|[a-z]*vr)\d{2,}", cid):
         return True
 
-    # タイトルに「VR」がトークンとして出現（Avril除外）
+    # タイトルに「VR」がトークンとして出現（Avril対策：前後が英数字でない）
     title = (item.get("title") or "")
     if re.search(r"(?<![A-Za-z0-9])VR(?![A-Za-z0-9])", title):
         return True
@@ -113,11 +120,11 @@ def base_params(offset: int, floor: str, use_keyword=True) -> dict:
         "affiliate_id": get_env("DMM_AFFILIATE_ID"),
         "site": "FANZA",
         "service": "digital",
-        "floor": floor,
+        "floor": floor,      # videoa / videoc
         "sort": "date",
         "output": "json",
         "hits": HITS,
-        "offset": offset,
+        "offset": offset,    # 1起点
     }
     if use_keyword:
         base["keyword"] = "VR"
@@ -137,21 +144,29 @@ def fetch_vr_items_from_floors() -> list[dict]:
                 break
             raw.extend(items)
             time.sleep(0.2)
+
     vr_items = [it for it in raw if contains_vr(it)]
     released = [it for it in vr_items if is_released(it)]
     print(f"[API] 総取得: {len(raw)} / VR判定: {len(vr_items)} / 発売OK: {len(released)}")
     released.sort(key=lambda x: x.get("date", ""), reverse=True)
     return released
 
-# ------------------ 本文生成 ------------------
+# ------------------ 本文生成（フォールバック） ------------------
 def fallback_description(item: dict) -> str:
     ii = item.get("iteminfo", {}) or {}
-    desc = item.get("description") or ""
-    if len(desc) < 20:
-        desc = html.unescape(
-            "、".join([x.get("name", "") for x in ii.get("genre", []) if isinstance(x, dict)])
-        )
-    return desc or "FANZA（DMM）VR作品の紹介です。"
+    for key in ("description","comment","story"):
+        v = (item.get(key) or ii.get(key) or "").strip()
+        if 20 <= len(v) <= 800:
+            return html.unescape(v)
+    cast  = "、".join([a.get("name","") for a in ii.get("actress",[]) if isinstance(a,dict)])
+    label = "、".join([l.get("name","") for l in ii.get("label",[])   if isinstance(l,dict)])
+    genres= "、".join([g.get("name","") for g in ii.get("genre",[])   if isinstance(g,dict)])
+    series= "、".join([s.get("name","") for s in ii.get("series",[])  if isinstance(s,dict)])
+    maker = "、".join([m.get("name","") for m in ii.get("maker",[])   if isinstance(m,dict)])
+    title = item.get("title","")
+    vol   = item.get("volume","")
+    base  = f"{title}。ジャンル：{genres}。出演：{cast}。シリーズ：{series}。メーカー：{maker}。レーベル：{label}。収録時間：{vol}。"
+    return base if len(base) > 10 else "FANZA（DMM）VR作品の自動紹介です。"
 
 # ------------------ WordPress投稿 ------------------
 def upload_image(wp: Client, url: str):
@@ -173,10 +188,14 @@ def create_wp_post(item: dict, wp: Client, category: str, aff_id: str) -> bool:
         print(f"→ 非VRスキップ: {title}")
         return False
 
-    exist = wp.call(GetPosts({"post_status": "publish", "s": title}))
-    if any(p.title == title for p in exist):
-        print(f"→ 既投稿: {title}")
-        return False
+    try:
+        exist = wp.call(GetPosts({"post_status": "publish", "s": title}))
+        if any(p.title == title for p in exist):
+            print(f"→ 既投稿: {title}")
+            return False
+    except Exception as e:
+        # 検索失敗は致命ではないので続行
+        print(f"[既投稿チェック失敗] {e}")
 
     siu = item.get("sampleImageURL") or {}
     images = siu.get("sample_l", {}).get("image") or siu.get("sample_s", {}).get("image") or []
@@ -187,10 +206,18 @@ def create_wp_post(item: dict, wp: Client, category: str, aff_id: str) -> bool:
 
     aff_link = make_affiliate_link(item["URL"], aff_id)
     desc = fallback_description(item)
-    html_content = f"<p><a href='{aff_link}' target='_blank'><img src='{images[0]}'></a></p><p>{desc}</p>"
+
+    parts = [
+        f'<p><a href="{aff_link}" target="_blank" rel="nofollow noopener"><img src="{images[0]}" alt="{title}"></a></p>',
+        f'<p><a href="{aff_link}" target="_blank" rel="nofollow noopener">{title}</a></p>',
+        f'<div>{desc}</div>',
+    ] + [f'<p><img src="{img}" alt="{title}"></p>' for img in images[1:]] + [
+        f'<p><a href="{aff_link}" target="_blank" rel="nofollow noopener">{title}</a></p>'
+    ]
+
     post = WordPressPost()
     post.title = title
-    post.content = html_content
+    post.content = "\n".join(parts)
     if thumb_id: post.thumbnail = thumb_id
     post.terms_names = {"category": [category]}
     post.post_status = "publish"
