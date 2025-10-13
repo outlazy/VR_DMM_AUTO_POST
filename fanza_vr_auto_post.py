@@ -2,13 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-FANZA（DMM）VR新着 → WordPress自動投稿（APIフロア横断・VR超厳密判定・1ファイル完結）
+FANZA（DMM）VR新着 → WordPress自動投稿（APIフロア横断・VR超厳密判定・可用性チェック・1ファイル）
 - DMM Affiliate API を floor=videoa / videoc で横断取得
 - VR厳密判定：
-    1) URLが media_type=vr または /vrvideo/ を含む → True
-    2) CIDが *vrNN / dsvrNN などVRパターン → True
-    3) 上記以外は「タイトルにVR」かつ「ジャンル名にVR系語彙（VR専用/8KVR等）」のときのみ True
-  => タイトルだけの“なんちゃってVR”は除外（例：Avril／VR絶頂など）
+    A) URL: media_type=vr or /vrvideo/
+    B) CID: *vrNN / dsvrNN など
+    C) タイトルにVRトークン ＋ ジャンルにもVR系語彙
+  → タイトルだけVRは除外
+- 発売判定は「日時」ではなく **可用性** で決定：
+    1) サンプル画像の HEAD/GET が 200 かつ 10KB 以上
+    2) 個別詳細ページ（video./www.）が 200
+  どちらか満たさない場合は未公開扱いで除外（=前倒し防止）
 """
 
 import os, re, time, html, json, pytz, requests
@@ -35,8 +39,7 @@ RECENT_DAYS = int(os.getenv("RECENT_DAYS", "3"))
 HITS = int(os.getenv("HITS", "30"))
 MAX_PAGES = int(os.getenv("MAX_PAGES", "6"))
 FLOORS = os.getenv("FLOORS", "videoa,videoc").split(",")
-REQUIRE_RELEASED = int(os.getenv("REQUIRE_RELEASED", "1"))
-RELEASE_GRACE_HOURS = int(os.getenv("RELEASE_GRACE_HOURS", "36"))
+AGE_GATE_COOKIE = os.getenv("AGE_GATE_COOKIE", "").strip()  # 例: "ckcy=1; age_check_done=1"
 
 # ------------------ ユーティリティ ------------------
 def now_jst():
@@ -64,9 +67,8 @@ def make_affiliate_link(url: str, aff_id: str) -> str:
     q["affiliate_id"] = aff_id
     return urlunparse((pu.scheme, pu.netloc, pu.path, pu.params, urlencode(q), pu.fragment))
 
-# ------------------ VR判定・発売済み判定（超厳密） ------------------
+# ------------------ VR判定（超厳密） ------------------
 def _has_vr_token_in_title(title: str) -> bool:
-    # 「VR」が前後英数字に接していない（Avril対策）
     return bool(re.search(r"(?<![A-Za-z0-9])VR(?![A-Za-z0-9])", title or "")) or any(
         kw in (title or "") for kw in ["【VR】", "VR専用", "8K VR", "8KVR", "ハイクオリティVR"]
     )
@@ -78,14 +80,7 @@ def _genre_has_vr_words(iteminfo: dict) -> bool:
     return any(re.search(rf"(?<![A-Za-z0-9]){re.escape(w)}(?![A-Za-z0-9])", joined) for w in vr_words)
 
 def contains_vr(item: dict) -> bool:
-    """
-    超厳密VR判定：
-      A) URL: media_type=vr or /vrvideo/ → True
-      B) CID: *vr + 数字（2桁以上） or dsvr + 数字 → True
-      C) タイトルにVRトークン かつ ジャンルにVR語彙 → True
-      それ以外は False
-    """
-    # A) URLで判定
+    # A) URL
     try:
         u = item.get("URL", "")
         pu = urlparse(u)
@@ -96,33 +91,100 @@ def contains_vr(item: dict) -> bool:
             return True
     except Exception:
         pass
-
-    # B) CIDで判定
+    # B) CID
     cid = (item.get("content_id") or item.get("product_id") or "").lower()
     if re.search(r"(?:^|[^a-z])(dsvr|idvr|[a-z]*vr)\d{2,}", cid):
         return True
-
     # C) タイトル + ジャンル
-    title_ok = _has_vr_token_in_title(item.get("title",""))
-    genre_ok = _genre_has_vr_words(item.get("iteminfo",{}) or {})
-    if title_ok and genre_ok:
+    if _has_vr_token_in_title(item.get("title","")) and _genre_has_vr_words(item.get("iteminfo",{}) or {}):
         return True
-
-    # ここまで来たら非VR
     return False
 
-def is_released(item: dict) -> bool:
-    if not REQUIRE_RELEASED:
-        return True
-    ds = item.get("date")
-    if not ds:
-        return False
+# ------------------ 可用性（発売済み相当）判定 ------------------
+def _headers_for_html():
+    h = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Referer": "https://video.dmm.co.jp/",
+    }
+    if AGE_GATE_COOKIE:
+        h["Cookie"] = AGE_GATE_COOKIE
+    return h
+
+def _candidate_detail_urls(item: dict) -> list[str]:
+    cid = (item.get("content_id") or item.get("product_id") or "").strip().lower()
+    u = item.get("URL","")
+    urls = []
+    if cid:
+        urls = [
+            f"https://video.dmm.co.jp/av/content/?id={cid}",
+            f"https://www.dmm.co.jp/digital/vrvideo/-/detail/=/cid={cid}/",
+            f"https://www.dmm.co.jp/vrvideo/-/detail/=/cid={cid}/",
+            f"https://www.dmm.co.jp/digital/videoa/-/detail/=/cid={cid}/",
+        ]
+    if u:
+        urls.append(u)
+    out, seen = [], set()
+    for x in urls:
+        if x not in seen:
+            seen.add(x); out.append(x)
+    return out
+
+def _url_ok(url: str) -> bool:
     try:
-        d = parse_jst_date(ds)
-        grace = d - timedelta(hours=RELEASE_GRACE_HOURS)
-        return grace <= now_jst()
+        r = requests.head(url, headers=_headers_for_html(), timeout=10, allow_redirects=True)
+        if r.status_code == 405:  # HEAD不可サイト
+            r = requests.get(url, headers=_headers_for_html(), timeout=12, allow_redirects=True, stream=True)
+        return 200 <= r.status_code < 300
     except Exception:
         return False
+
+def _image_ok(url: str) -> bool:
+    try:
+        # まず HEAD
+        r = requests.head(url, timeout=10, allow_redirects=True)
+        if r.status_code == 405 or r.headers.get("content-length") in (None, "0"):
+            # HEAD不可やサイズ不明は GET でサイズ確認（最初の ~16KB 読む）
+            r = requests.get(url, timeout=12, allow_redirects=True, stream=True)
+            size = 0
+            for chunk in r.iter_content(4096):
+                size += len(chunk)
+                if size >= 16384:
+                    break
+            ok = 200 <= r.status_code < 300 and size >= 10240
+            return ok
+        # content-length が 10KB 以上
+        try:
+            cl = int(r.headers.get("content-length","0"))
+        except ValueError:
+            cl = 0
+        return 200 <= r.status_code < 300 and cl >= 10240
+    except Exception:
+        return False
+
+def is_available_now(item: dict) -> bool:
+    """
+    “前倒し禁止”のための可用性判定。
+    - サンプル画像の実体が取得可能（>=10KB）
+    - 詳細ページのHTTP 200
+    両方OKで True。どちらか欠けたら False。
+    """
+    # 画像チェック
+    siu = item.get("sampleImageURL") or {}
+    imgs = (siu.get("sample_l",{}) or {}).get("image") or (siu.get("sample_s",{}) or {}).get("image") or []
+    img_ok = False
+    for im in imgs[:2]:  # 最初の2枚で十分
+        if _image_ok(im):
+            img_ok = True
+            break
+    if not img_ok:
+        return False
+
+    # 詳細ページチェック
+    for du in _candidate_detail_urls(item):
+        if _url_ok(du):
+            return True
+    return False
 
 # ------------------ DMM API ------------------
 def dmm_request(params: dict) -> dict:
@@ -164,12 +226,19 @@ def fetch_vr_items_from_floors() -> list[dict]:
             raw.extend(items)
             time.sleep(0.2)
 
+    # VR作品のみ
     vr_items = [it for it in raw if contains_vr(it)]
-    unreleased = [it for it in vr_items if not is_released(it)]
-    released = [it for it in vr_items if is_released(it)]
-    print(f"[API] 総取得: {len(raw)} / VR判定: {len(vr_items)} / 未発売: {len(unreleased)} / 発売OK: {len(released)}")
-    released.sort(key=lambda x: x.get("date", ""), reverse=True)
-    return released
+    # 可用性（発売済み相当）フィルタ
+    available = []
+    for it in vr_items:
+        ok = is_available_now(it)
+        print(f"  - [{ 'OK' if ok else 'NG' }] {it.get('title','')}")
+        if ok:
+            available.append(it)
+
+    print(f"[API] 総取得: {len(raw)} / VR判定: {len(vr_items)} / 可用性OK: {len(available)}")
+    available.sort(key=lambda x: x.get("date",""), reverse=True)
+    return available
 
 # ------------------ 本文フォールバック ------------------
 def fallback_description(item: dict) -> str:
@@ -246,12 +315,13 @@ def create_wp_post(item: dict, wp: Client, category: str, aff_id: str) -> bool:
 
 # ------------------ メイン ------------------
 def main():
-    print(f"[{now_jst()}] VR新着投稿開始（VRタイトル+ジャンル連動/URL/CIDの超厳密判定）")
+    print(f"[{now_jst()}] VR新着投稿開始（VR超厳密＋可用性チェック）")
     wp = Client(get_env("WP_URL"), get_env("WP_USER"), get_env("WP_PASS"))
     cat = get_env("CATEGORY")
     aff = get_env("DMM_AFFILIATE_ID")
 
     items = fetch_vr_items_from_floors()
+    # 一応、直近優先ロジックは残す
     boundary = now_jst() - timedelta(days=RECENT_DAYS)
     recent = [i for i in items if parse_jst_date(i.get("date", "")) >= boundary]
     backlog = [i for i in items if i not in recent]
