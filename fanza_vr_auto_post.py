@@ -2,18 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-FANZA（DMM）VR新着 → WordPress自動投稿
-取得元を **/av/list/?media_type=vr&sort=date** の一覧スクレイプに切替（APIは補完に使用）
-- VR一覧ページから CID を抽出 → CIDごとに DMM API で詳細取得 → 発売済のみを日付降順
-- 年齢ゲート対策で Cookie を送信（任意）
-- 説明文抽出は www 優先・404除外の既存ロジックを継承
+FANZA（DMM）VR新着 → WordPress自動投稿（完成版）
+- 取得元：/av/list/?media_type=vr&sort=date（video）＋ www側の /vrvideo リストを併用
+- リストから CID を抽出 → DMM API（cid 指定）で詳細補完
+- 発売済みのみ（日付<=現在）を日付降順で整列し、直近RECENT_DAYS優先で投稿
+- 説明文抽出は www 優先・video も候補、404除外、メタ/JSON-LD フォールバック
+- 年齢ゲート対策：AGE_GATE_COOKIE を任意付与（例："ckcy=1; age_check_done=1"）
 
-必要 Secrets/Env（従来と同じ）
+必要 Secrets/Env（必須）
   WP_URL / WP_USER / WP_PASS / DMM_API_ID / DMM_AFFILIATE_ID / CATEGORY
 任意 Env
   POST_LIMIT=2 / RECENT_DAYS=3 / VR_LIST_PAGES=3 / SCRAPE_DESC=1
-  AGE_GATE_COOKIE="ckcy=1; age_check_done=1"
-  FORCE_DETAIL_DOMAIN=www
+  AGE_GATE_COOKIE="ckcy=1; age_check_done=1" / FORCE_DETAIL_DOMAIN=www
 """
 
 import os
@@ -39,7 +39,6 @@ from wordpress_xmlrpc.methods import media, posts
 from wordpress_xmlrpc.methods.posts import GetPosts
 from wordpress_xmlrpc.compat import xmlrpc_client
 
-# ▼ HTMLパース（beautifulsoup4 / lxml 推奨）
 try:
     from bs4 import BeautifulSoup
 except Exception:
@@ -48,14 +47,13 @@ except Exception:
 DMM_API_URL = "https://api.dmm.com/affiliate/v3/ItemList"
 
 # ===== 可変パラメータ（envで上書き可） =====
-POST_LIMIT       = int(os.environ.get("POST_LIMIT", "2"))   # 1回の実行で投稿する最大件数
-RECENT_DAYS      = int(os.environ.get("RECENT_DAYS", "3"))   # 直近何日を“新作”とみなすか
-VR_LIST_PAGES    = int(os.environ.get("VR_LIST_PAGES", "3")) # VR一覧ページの巡回ページ数
-SCRAPE_DESC      = os.environ.get("SCRAPE_DESC", "1") == "1"  # 1=本文抽出有効
-AGE_GATE_COOKIE  = os.environ.get("AGE_GATE_COOKIE", "").strip()
+POST_LIMIT          = int(os.environ.get("POST_LIMIT", "2"))
+RECENT_DAYS         = int(os.environ.get("RECENT_DAYS", "3"))
+VR_LIST_PAGES       = int(os.environ.get("VR_LIST_PAGES", "3"))
+SCRAPE_DESC         = os.environ.get("SCRAPE_DESC", "1") == "1"
+AGE_GATE_COOKIE     = os.environ.get("AGE_GATE_COOKIE", "").strip()
 FORCE_DETAIL_DOMAIN = os.environ.get("FORCE_DETAIL_DOMAIN", "www").strip()
 
-# =========================================
 NG_DESCRIPTIONS = [
     "From here on, it will be an adult site",
     "18歳未満", "未成年", "18才未満",
@@ -117,7 +115,7 @@ def fallback_description(item: dict) -> str:
     base = f"{title}。ジャンル：{genres}。出演：{cast}。レーベル：{label}。収録時間：{volume}。"
     return base if len(base) > 10 else "FANZA（DMM）VR動画の自動投稿です。"
 
-# ------------------ 本文抽出（www優先／404除外） ------------------
+# ------------------ 本文抽出 ------------------
 
 def _clean_text(s: str) -> str:
     s = html.unescape(s or "").strip()
@@ -221,7 +219,7 @@ def extract_main_description_from_html_bytes(html_bytes: bytes) -> str | None:
                     return d
     return None
 
-# ------------------ URL候補生成（www/video 両面） ------------------
+# ------------------ URL候補生成 ------------------
 
 def _strip_affiliate_params(u: str) -> str:
     try:
@@ -241,29 +239,31 @@ def _extract_cid(u: str) -> str:
 
 
 def _build_candidate_urls(item: dict, original_url: str) -> list[str]:
+    """video の content/?id= を最優先し、www 側も候補に入れる"""
+    cid = (item.get("content_id") or item.get("product_id") or _extract_cid(original_url) or "").strip().lower()
     urls: list[str] = []
-    base = _strip_affiliate_params(original_url)
-    urls.append(base)
-
-    cid = (item.get("content_id") or item.get("product_id") or _extract_cid(base) or "").strip()
     if cid:
-        urls.extend([
-            f"https://www.dmm.co.jp/digital/videoa/-/detail/=/cid={cid}/",
+        urls = [
+            f"https://video.dmm.co.jp/av/content/?id={cid}",
             f"https://www.dmm.co.jp/digital/vrvideo/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/vrvideo/-/detail/=/cid={cid}/",
+            f"https://www.dmm.co.jp/digital/videoa/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/av/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/mono/dvd/-/detail/=/cid={cid}/",
-            f"https://video.dmm.co.jp/av/content/?id={cid}",
-        ])
+        ]
+    else:
+        base = _strip_affiliate_params(original_url)
+        urls.append(base)
 
+    # video/www 両方生成（保険）
     extra: list[str] = []
     for u in list(urls):
         try:
             pu = urlparse(u)
             if pu.netloc.startswith("video."):
-                extra.append(urlunparse((pu.scheme, "www." + pu.netloc.split(".",1)[1], pu.path, pu.params, pu.query, pu.fragment)))
+                extra.append(urlunparse((pu.scheme, "www." + pu.netloc.split(".", 1)[1], pu.path, pu.params, pu.query, pu.fragment)))
             elif pu.netloc.startswith("www."):
-                extra.append(urlunparse((pu.scheme, "video." + pu.netloc.split(".",1)[1], pu.path.replace("/digital/", "/av/"), pu.params, pu.query, pu.fragment)))
+                extra.append(urlunparse((pu.scheme, "video." + pu.netloc.split(".", 1)[1], pu.path.replace("/digital/", "/av/"), pu.params, pu.query, pu.fragment)))
         except Exception:
             pass
     urls.extend(extra)
@@ -342,7 +342,7 @@ def is_released(item: dict) -> bool:
 # ------------------ DMM API 呼び出し ------------------
 
 def dmm_request(params: dict) -> dict:
-    r = requests.get(DMM_API_URL, params=params, timeout=12)
+    r = requests.get(DMM_API_URL, params=params, timeout=14)
     if r.status_code != 200:
         try:
             print("---- DMM API Error ----")
@@ -384,7 +384,13 @@ def fetch_item_by_cid(cid: str) -> dict | None:
 # ------------------ VR一覧スクレイプ ------------------
 
 def scrape_vr_cids(max_pages: int = VR_LIST_PAGES) -> list[str]:
-    """https://video.dmm.co.jp/av/list/?media_type=vr&sort=date からCIDを抽出"""
+    """VR新着リストからCIDを抽出。
+    video側がJS描画で空を返すケースに備え、www側のリストも併用。
+    対象:
+      - https://video.dmm.co.jp/av/list/?media_type=vr&sort=date
+      - https://www.dmm.co.jp/digital/vrvideo/-/list/=/sort=date/
+      - https://www.dmm.co.jp/vrvideo/-/list/=/sort=date/
+    """
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -392,31 +398,59 @@ def scrape_vr_cids(max_pages: int = VR_LIST_PAGES) -> list[str]:
             "Chrome/123.0.0.0 Safari/537.36"
         ),
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": "https://www.dmm.co.jp/",
     }
     if AGE_GATE_COOKIE:
         headers["Cookie"] = AGE_GATE_COOKIE
 
-    base = "https://video.dmm.co.jp/av/list/?media_type=vr&sort=date"
-    found: list[str] = []
-    pat = re.compile(r"(?:content/\?id=|cid=)([a-z0-9_]+)", re.I)
+    bases = [
+        "https://video.dmm.co.jp/av/list/?media_type=vr&sort=date",
+        "https://www.dmm.co.jp/digital/vrvideo/-/list/=/sort=date/",
+        "https://www.dmm.co.jp/vrvideo/-/list/=/sort=date/",
+    ]
 
-    for p in range(1, max_pages + 1):
-        url = base + (f"&page={p}" if p > 1 else "")
-        try:
-            r = requests.get(url, headers=headers, timeout=12)
-            if r.status_code != 200:
-                print(f"VR一覧取得失敗: {r.status_code} {url}")
+    found: list[str] = []
+    pat_href = re.compile(r"(?:/detail/=/cid=|content/\?id=)([a-z0-9_]+)", re.I)
+    pat_data = re.compile(r"(?:data-cid=\"|\\\"cid\\\":\\\")(?:)([a-z0-9_]+)", re.I)
+
+    def _norm_cid(c: str) -> str:
+        return re.sub(r"[^a-z0-9_]", "", c.strip().lower())
+
+    def collect_from_html(txt: str):
+        cids = []
+        cids += pat_href.findall(txt)
+        cids += pat_data.findall(txt)
+        cids += re.findall(r"cid=([a-z0-9_]+)", txt, flags=re.I)
+        out_cids, seen = [], set()
+        for c in cids:
+            nc = _norm_cid(c)
+            if nc and nc not in seen:
+                seen.add(nc)
+                out_cids.append(nc)
+        return out_cids
+
+    for base in bases:
+        for p in range(1, max_pages + 1):
+            url = base + (f"?page={p}" if ("?" not in base and p > 1) else (f"&page={p}" if p > 1 else ""))
+            try:
+                r = requests.get(url, headers=headers, timeout=14)
+                if r.status_code != 200:
+                    print(f"VR一覧取得失敗: {r.status_code} {url}")
+                    break
+                txt = r.text
+                cids = collect_from_html(txt)
+                if not cids:
+                    print(f"CIDが見つかりません: {url}")
+                else:
+                    print(f"[VR一覧] {('www' if 'www.dmm.co.jp' in url else 'video')} page {p}: CID {len(cids)}件")
+                found.extend(cids)
+            except Exception as e:
+                print(f"VR一覧取得エラー: {e}")
                 break
-            html_txt = r.text
-            cids = pat.findall(html_txt)
-            if not cids:
-                print(f"CIDが見つかりません: {url}")
-            found.extend(cids)
-            print(f"[VR一覧] page {p}: CID {len(cids)}件")
-        except Exception as e:
-            print(f"VR一覧取得エラー: {e}")
-            break
-        time.sleep(0.2)
+            time.sleep(0.25)
 
     # 重複排除（上位=新しい方を優先）
     seen, out = set(), []
@@ -437,7 +471,6 @@ def fetch_released_from_vr_list() -> list[dict]:
             items.append(it)
         if i % 10 == 0:
             time.sleep(0.3)
-    # 発売済み＆VR判定
     released = [it for it in items if contains_vr(it) and is_released(it)]
     released.sort(key=lambda x: x.get('date', ''), reverse=True)
     print(f"VR発売済み件数: {len(released)}（一覧→API補完／日付降順）")
