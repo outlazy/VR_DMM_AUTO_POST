@@ -2,58 +2,280 @@
 # -*- coding: utf-8 -*-
 
 """
-FANZA（DMM）VR新着 → WordPress自動投稿（完成版）
-- 取得元：/av/list/?media_type=vr&sort=date（video）＋ www側の /vrvideo リストを併用
-- リストから CID を抽出 → DMM API（cid 指定）で詳細補完
-- 発売済みのみ（日付<=現在）を日付降順で整列し、直近RECENT_DAYS優先で投稿
-- 説明文抽出は www 優先・video も候補、404除外、メタ/JSON-LD フォールバック
-- 年齢ゲート対策：AGE_GATE_COOKIE を任意付与（例："ckcy=1; age_check_done=1"）
+FANZA（DMM）VR新着 → WordPress自動投稿（2025-10 パッチ適用版）
+- 一覧スクレイプ（video指定URL/genre=6548優先）→ 取れなければ API フォールバック
+- API日付のフォーマット揺れを多段パース（YYYY-MM-DD / YYYY-MM-DD HH:MM(:SS)）
+- CID抽出を強化（data-* / JSON / NUXT/NEXT）
+- 詳細ページURLの候補最適化（videoの /av/content/?id=xxxx を最優先 + www保険）
 
-必要 Secrets/Env（必須）
-  WP_URL / WP_USER / WP_PASS / DMM_API_ID / DMM_AFFILIATE_ID / CATEGORY
-任意 Env
-  POST_LIMIT=2 / RECENT_DAYS=3 / VR_LIST_PAGES=3 / SCRAPE_DESC=1
-  AGE_GATE_COOKIE="ckcy=1; age_check_done=1" / FORCE_DETAIL_DOMAIN=www
+必要 Env:
+  WP_URL / WP_USER / WP_PASS / CATEGORY / DMM_API_ID / DMM_AFFILIATE_ID
+任意 Env:
+  POST_LIMIT=2 / RECENT_DAYS=3 / MAX_PAGES=6 / HITS=30 / VR_LIST_PAGES=3
+  SCRAPE_DESC=1 / AGE_GATE_COOKIE="ckcy=1; age_check_done=1" / FORCE_DETAIL_DOMAIN=www
 """
 
-import os
-import re
-import json
-import html
-import time
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+import os, re, json, html, time
 from datetime import datetime, timedelta
-
-# ---- Py3.10+ 互換パッチ（古いライブラリの collections.* 参照対策）----
-import collections as _collections
-import collections.abc as _abc
-for _name in ("Iterable", "Mapping", "MutableMapping", "Sequence"):
-    if not hasattr(_collections, _name) and hasattr(_abc, _name):
-        setattr(_collections, _name, getattr(_abc, _name))
-# ---------------------------------------------------------------------
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import pytz
 import requests
+from bs4 import BeautifulSoup
+
+# WordPress
 from wordpress_xmlrpc import Client, WordPressPost
 from wordpress_xmlrpc.methods import media, posts
 from wordpress_xmlrpc.methods.posts import GetPosts
 from wordpress_xmlrpc.compat import xmlrpc_client
 
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    BeautifulSoup = None
+# ===== 可変設定 =====
+MAX_PAGES   = int(os.environ.get("MAX_PAGES", "6"))
+HITS        = int(os.environ.get("HITS", "30"))
+POST_LIMIT  = int(os.environ.get("POST_LIMIT", "2"))
+RECENT_DAYS = int(os.environ.get("RECENT_DAYS", "3"))
+VR_LIST_PAGES = int(os.environ.get("VR_LIST_PAGES", "3"))
+SCRAPE_DESC = os.environ.get("SCRAPE_DESC", "1") == "1"
+AGE_GATE_COOKIE = os.environ.get("AGE_GATE_COOKIE", "").strip()
+FORCE_DETAIL_DOMAIN = os.environ.get("FORCE_DETAIL_DOMAIN", "www").strip()
 
 DMM_API_URL = "https://api.dmm.com/affiliate/v3/ItemList"
 
-# ===== 可変パラメータ（envで上書き可） =====
-POST_LIMIT          = int(os.environ.get("POST_LIMIT", "2"))
-RECENT_DAYS         = int(os.environ.get("RECENT_DAYS", "3"))
-VR_LIST_PAGES       = int(os.environ.get("VR_LIST_PAGES", "3"))
-SCRAPE_DESC         = os.environ.get("SCRAPE_DESC", "1") == "1"
-AGE_GATE_COOKIE     = os.environ.get("AGE_GATE_COOKIE", "").strip()
-FORCE_DETAIL_DOMAIN = os.environ.get("FORCE_DETAIL_DOMAIN", "www").strip()
+# ===== 共通 =====
+def now_jst() -> datetime:
+    return datetime.now(pytz.timezone('Asia/Tokyo'))
 
+
+def parse_jst_date(s: str) -> datetime:
+    """
+    DMM APIのdateは 'YYYY-MM-DD' / 'YYYY-MM-DD HH:MM' / 'YYYY-MM-DD HH:MM:SS' が混在。
+    いずれにも対応し、JSTにローカライズする。
+    パース不能時は 1970-01-01 JST を返す（過去扱い）。
+    """
+    jst = pytz.timezone('Asia/Tokyo')
+    s = (s or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return jst.localize(dt)
+        except ValueError:
+            continue
+    m = re.search(r"(20\d{2}-\d{2}-\d{2})", s)
+    if m:
+        dt = datetime.strptime(m.group(1), "%Y-%m-%d")
+        return jst.localize(dt)
+    return jst.localize(datetime(1970, 1, 1))
+
+
+def get_env(key: str, required: bool = True, default=None):
+    v = os.environ.get(key, default)
+    if required and not v:
+        raise RuntimeError(f"環境変数 {key} が設定されていません")
+    return v
+
+
+def make_affiliate_link(url: str, aff_id: str) -> str:
+    p = urlparse(url)
+    qs = dict(parse_qsl(p.query))
+    qs["affiliate_id"] = aff_id
+    new_q = urlencode(qs)
+    return urlunparse((p.scheme, p.netloc, p.path, p.params, new_q, p.fragment))
+
+# ===== VR判定・発売済み =====
+def contains_vr(item: dict) -> bool:
+    if (item.get("floor_code") or "").lower() == "vrvideo":
+        return True
+    if "VR" in (item.get("floor_name") or ""):
+        return True
+    ii = item.get("iteminfo", {}) or {}
+    names = [g.get("name", "") for g in ii.get("genre", []) if isinstance(g, dict)]
+    joined = " ".join(names)
+    keys = ["VR", "ＶＲ", "バーチャル", "8K VR", "VR専用", "ハイクオリティVR"]
+    return any(k in joined for k in keys)
+
+
+def is_released(item: dict) -> bool:
+    ds = item.get("date")
+    if not ds:
+        return False
+    try:
+        return parse_jst_date(ds) <= now_jst()
+    except Exception:
+        return False
+
+# ===== DMM API =====
+def dmm_request(params: dict) -> dict:
+    r = requests.get(DMM_API_URL, params=params, timeout=14)
+    if r.status_code != 200:
+        try:
+            print("---- DMM API Error ----")
+            print(r.text[:2000])
+            print("-----------------------")
+        finally:
+            r.raise_for_status()
+    data = r.json()
+    res = data.get("result", {})
+    if isinstance(res, dict) and res.get("status") == "NG":
+        msg = res.get("message") or res.get("error", "")
+        raise RuntimeError(f"DMM API NG: {msg}")
+    return res
+
+
+def fetch_all_vr_released_sorted_api() -> list[dict]:
+    """floor=videoa → videoc（vrvideoは 400が出る環境があるため既定ではスキップ）。"""
+    API_ID = get_env("DMM_API_ID")
+    AFF_ID = get_env("DMM_AFFILIATE_ID")
+    floors = [s.strip() for s in os.environ.get("DMM_FLOORS", "videoa,videoc").split(",") if s.strip()]
+    all_items: list[dict] = []
+
+    def base_params(offset: int, floor: str, use_keyword: bool) -> dict:
+        p = {
+            "api_id": API_ID,
+            "affiliate_id": AFF_ID,
+            "site": "FANZA",
+            "service": "digital",
+            "floor": floor,
+            "sort": "date",
+            "output": "json",
+            "hits": HITS,
+            "offset": offset,
+        }
+        if use_keyword:
+            p["keyword"] = "VR"
+        return p
+
+    for floor in floors:
+        print(f"[API] floor={floor}")
+        for page in range(MAX_PAGES):
+            offset = 1 + page * HITS
+            print(f"[API] page {page+1} fetch (offset={offset}) with keyword=VR")
+            try:
+                res = dmm_request(base_params(offset, floor, use_keyword=True))
+                items = res.get("items", []) or []
+            except Exception as e:
+                print(f"[API] {floor} keyword=VR 失敗: {e} → keywordなしで再試行")
+                try:
+                    res = dmm_request(base_params(offset, floor, use_keyword=False))
+                    items = res.get("items", []) or []
+                except Exception as e2:
+                    print(f"[API] {floor} keywordなしでも失敗: {e2} → このfloorは打ち切り")
+                    break
+            print(f"[API] 取得件数: {len(items)}")
+            if not items:
+                break
+            all_items.extend(items)
+
+    released = [it for it in all_items if contains_vr(it) and is_released(it)]
+    released.sort(key=lambda x: x.get('date', ''), reverse=True)
+    print(f"[API] VR発売済み件数: {len(released)}（floor複合／日付降順）")
+    return released
+
+# ===== 一覧スクレイプ =====
+def scrape_vr_cids(max_pages: int = VR_LIST_PAGES) -> list[str]:
+    """VR新着リストからCIDを抽出（JS描画/データ属性/JSONに対応）。"""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": "https://www.dmm.co.jp/",
+    }
+    if AGE_GATE_COOKIE:
+        headers["Cookie"] = AGE_GATE_COOKIE
+
+    bases = [
+        "https://video.dmm.co.jp/av/list/?genre=6548&media_type=vr&release=latest&sort=suggest",
+        "https://video.dmm.co.jp/av/list/?media_type=vr&sort=date",
+        "https://www.dmm.co.jp/digital/vrvideo/-/list/=/sort=date/",
+        "https://www.dmm.co.jp/vrvideo/-/list/=/sort=date/",
+    ]
+
+    found: list[str] = []
+
+    pat_href = re.compile(r"(?:/detail/=/cid=|content/\?id=)([a-z0-9_]+)", re.I)
+    pat_data = re.compile(r"(?:data-cid=\"|\\\"cid\\\":\\\")(?:)([a-z0-9_]+)", re.I)
+    pat_prod  = re.compile(r'(?:data-product-id|data-content-id|data-gtm-list-product-id)=["\']([a-z0-9_]+)["\']', re.I)
+    pat_json1 = re.compile(r'\"cid\"\s*:\s*\"([a-z0-9_]+)\"', re.I)
+    pat_json2 = re.compile(r'\"contentId\"\s*:\s*\"([a-z0-9_]+)\"', re.I)
+
+    def _norm_cid(c: str) -> str:
+        return re.sub(r"[^a-z0-9_]", "", c.strip().lower())
+
+    def collect_from_html(txt: str):
+        cids = []
+        cids += pat_href.findall(txt)
+        cids += pat_data.findall(txt)
+        cids += pat_prod.findall(txt)
+        cids += pat_json1.findall(txt)
+        cids += pat_json2.findall(txt)
+        cids += re.findall(r"cid=([a-z0-9_]+)", txt, flags=re.I)
+        out_cids, seen = [], set()
+        for c in cids:
+            nc = _norm_cid(c)
+            if nc and nc not in seen:
+                seen.add(nc)
+                out_cids.append(nc)
+        return out_cids
+
+    for base in bases:
+        for p in range(1, max_pages + 1):
+            url = base + (f"?page={p}" if ("?" not in base and p > 1) else (f"&page={p}" if p > 1 else ""))
+            try:
+                r = requests.get(url, headers=headers, timeout=14)
+                if r.status_code != 200:
+                    print(f"VR一覧取得失敗: {r.status_code} {url}")
+                    break
+                txt = r.text
+                cids = collect_from_html(txt)
+                if not cids:
+                    print(f"CIDが見つかりません: {url}")
+                else:
+                    label = 'www' if 'www.dmm.co.jp' in url else 'video'
+                    print(f"[VR一覧] {label} page {p}: CID {len(cids)}件")
+                found.extend(cids)
+            except Exception as e:
+                print(f"VR一覧取得エラー: {e}")
+                break
+            time.sleep(0.25)
+
+    seen, out = set(), []
+    for cid in found:
+        if cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+# ===== APIでCIDを補完 =====
+def fetch_item_by_cid(cid: str) -> dict | None:
+    API_ID = get_env("DMM_API_ID")
+    AFF_ID = get_env("DMM_AFFILIATE_ID")
+    params = {
+        "api_id": API_ID,
+        "affiliate_id": AFF_ID,
+        "site": "FANZA",
+        "service": "digital",
+        "floor": "videoa",
+        "article": "actress",
+        "cid": cid,
+        "output": "json",
+        "hits": 1,
+        "offset": 1,
+    }
+    try:
+        res = dmm_request(params)
+        items = res.get("items", []) or []
+        return items[0] if items else None
+    except Exception as e:
+        print(f"CID補完失敗: {cid} ({e})")
+        return None
+
+
+# ===== 説明文抽出 =====
 NG_DESCRIPTIONS = [
     "From here on, it will be an adult site",
     "18歳未満", "未成年", "18才未満",
@@ -65,31 +287,6 @@ AGE_MARKERS = [
     "under the age of 18", "age verification"
 ]
 
-# ------------------ 共通ユーティリティ ------------------
-
-def now_jst() -> datetime:
-    return datetime.now(pytz.timezone('Asia/Tokyo'))
-
-
-def parse_jst_date(s: str) -> datetime:
-    jst = pytz.timezone('Asia/Tokyo')
-    return jst.localize(datetime.strptime(s, "%Y-%m-%d %H:%M:%S"))
-
-
-def get_env(key: str, required: bool = True, default=None):
-    v = os.environ.get(key, default)
-    if required and not v:
-        raise RuntimeError(f"環境変数 {key} が設定されていません")
-    return v
-
-
-def make_affiliate_link(url: str, aff_id: str) -> str:
-    parsed = urlparse(url)
-    qs = dict(parse_qsl(parsed.query))
-    qs["affiliate_id"] = aff_id
-    new_query = urlencode(qs)
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
-
 
 def is_valid_description(desc: str) -> bool:
     if not desc or len(desc.strip()) < 30:
@@ -99,23 +296,6 @@ def is_valid_description(desc: str) -> bool:
             return False
     return True
 
-# ------------------ 代替本文（API/自動生成） ------------------
-
-def fallback_description(item: dict) -> str:
-    ii = item.get("iteminfo", {}) or {}
-    for key in ("description", "comment", "story"):
-        val = (item.get(key) or ii.get(key) or "").strip()
-        if 20 <= len(val) <= 800 and is_valid_description(val):
-            return val
-    cast = "、".join([a.get("name", "") for a in ii.get("actress", []) if isinstance(a, dict)])
-    label = "、".join([l.get("name", "") for l in ii.get("label", []) if isinstance(l, dict)])
-    genres = "、".join([g.get("name", "") for g in ii.get("genre", []) if isinstance(g, dict)])
-    volume = item.get("volume", "")
-    title = item.get("title", "")
-    base = f"{title}。ジャンル：{genres}。出演：{cast}。レーベル：{label}。収録時間：{volume}。"
-    return base if len(base) > 10 else "FANZA（DMM）VR動画の自動投稿です。"
-
-# ------------------ 本文抽出 ------------------
 
 def _clean_text(s: str) -> str:
     s = html.unescape(s or "").strip()
@@ -126,15 +306,12 @@ def _clean_text(s: str) -> str:
 
 
 def extract_main_description_from_html_bytes(html_bytes: bytes) -> str | None:
-    if not SCRAPE_DESC or not BeautifulSoup or not html_bytes:
+    if not SCRAPE_DESC or not html_bytes:
         return None
     try:
-        try:
-            soup = BeautifulSoup(html_bytes, "lxml")
-        except Exception:
-            soup = BeautifulSoup(html_bytes, "html.parser")
+        soup = BeautifulSoup(html_bytes, "lxml")
     except Exception:
-        return None
+        soup = BeautifulSoup(html_bytes, "html.parser")
 
     raw_text = soup.get_text(" ", strip=True)
     if any(k in raw_text for k in AGE_MARKERS):
@@ -196,13 +373,13 @@ def extract_main_description_from_html_bytes(html_bytes: bytes) -> str | None:
 
     m = soup.select_one('meta[property="og:description"]')
     if m and m.get("content"):
-        d = _clean_text(m["content"])
+        d = _clean_text(m["content"]) 
         if 30 <= len(d) <= 700 and is_valid_description(d):
             return d
 
     m = soup.select_one('meta[name="description"]')
     if m and m.get("content"):
-        d = _clean_text(m["content"])
+        d = _clean_text(m["content"]) 
         if 30 <= len(d) <= 700 and is_valid_description(d):
             return d
 
@@ -219,7 +396,6 @@ def extract_main_description_from_html_bytes(html_bytes: bytes) -> str | None:
                     return d
     return None
 
-# ------------------ URL候補生成 ------------------
 
 def _strip_affiliate_params(u: str) -> str:
     try:
@@ -239,8 +415,7 @@ def _extract_cid(u: str) -> str:
 
 
 def _build_candidate_urls(item: dict, original_url: str) -> list[str]:
-    """video の content/?id= を最優先し、www 側も候補に入れる"""
-    cid = (item.get("content_id") or item.get("product_id") or _extract_cid(original_url) or "").strip().lower()
+    cid = (item.get("content_id") or item.get("product_id") or _extract_cid(original_url) or "").lower()
     urls: list[str] = []
     if cid:
         urls = [
@@ -249,13 +424,11 @@ def _build_candidate_urls(item: dict, original_url: str) -> list[str]:
             f"https://www.dmm.co.jp/vrvideo/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/digital/videoa/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/av/-/detail/=/cid={cid}/",
-            f"https://www.dmm.co.jp/mono/dvd/-/detail/=/cid={cid}/",
         ]
     else:
         base = _strip_affiliate_params(original_url)
         urls.append(base)
 
-    # video/www 両方生成（保険）
     extra: list[str] = []
     for u in list(urls):
         try:
@@ -279,7 +452,6 @@ def _build_candidate_urls(item: dict, original_url: str) -> list[str]:
             out.append(u)
     return out
 
-# ------------------ 説明文抽出（本文→メタ→JSONLD→フォールバック） ------------------
 
 def fetch_description_from_detail_page(url: str, item: dict) -> str:
     if not SCRAPE_DESC:
@@ -320,221 +492,25 @@ def fetch_description_from_detail_page(url: str, item: dict) -> str:
         print(f"説明抽出最終エラー: {last_err}")
     return fallback_description(item)
 
-# ------------------ VR判定・発売済み判定 ------------------
 
-def contains_vr(item: dict) -> bool:
+# ===== フォールバック説明文 =====
+def fallback_description(item: dict) -> str:
     ii = item.get("iteminfo", {}) or {}
-    names = [g.get("name", "") for g in ii.get("genre", []) if isinstance(g, dict)]
-    joined = " ".join(names)
-    keys = ["VR", "ＶＲ", "バーチャル", "8K VR", "VR専用", "ハイクオリティVR"]
-    return any(k in joined for k in keys)
+    for key in ("description", "comment", "story"):
+        val = (item.get(key) or ii.get(key) or "").strip()
+        if 20 <= len(val) <= 800 and is_valid_description(val):
+            return val
+    cast = "、".join([a.get("name", "") for a in ii.get("actress", []) if isinstance(a, dict)])
+    label = "、".join([l.get("name", "") for l in ii.get("label", []) if isinstance(l, dict)])
+    genres = "、".join([g.get("name", "") for g in ii.get("genre", []) if isinstance(g, dict)])
+    volume = item.get("volume", "")
+    title = item.get("title", "")
+    base = f"{title}。ジャンル：{genres}。出演：{cast}。レーベル：{label}。収録時間：{volume}。"
+    return base if len(base) > 10 else "FANZA（DMM）VR動画の自動投稿です。"
 
-
-def is_released(item: dict) -> bool:
-    ds = item.get("date")
-    if not ds:
-        return False
-    try:
-        return parse_jst_date(ds) <= now_jst()
-    except Exception:
-        return False
-
-# ------------------ DMM API 呼び出し ------------------
-
-def dmm_request(params: dict) -> dict:
-    r = requests.get(DMM_API_URL, params=params, timeout=14)
-    if r.status_code != 200:
-        try:
-            print("---- DMM API Error ----")
-            print(r.text[:2000])
-            print("-----------------------")
-        finally:
-            r.raise_for_status()
-    data = r.json()
-    res = data.get("result", {})
-    if isinstance(res, dict) and res.get("status") == "NG":
-        msg = res.get("message") or res.get("error", "")
-        raise RuntimeError(f"DMM API NG: {msg}")
-    return res
-
-# ===== APIフォールバック（一覧が拾えない時に使用） =====
-HITS_API   = int(os.environ.get("HITS", "30"))
-MAX_PAGES_API = int(os.environ.get("MAX_PAGES", "6"))
-
-def _base_api_params(offset: int, use_keyword: bool = True) -> dict:
-    API_ID = get_env("DMM_API_ID")
-    AFF_ID = get_env("DMM_AFFILIATE_ID")
-    p = {
-        "api_id": API_ID,
-        "affiliate_id": AFF_ID,
-        "site": "FANZA",
-        "service": "digital",
-        "floor": "videoa",
-        "sort": "date",
-        "output": "json",
-        "hits": HITS_API,
-        "offset": offset,
-    }
-    if use_keyword:
-        p["keyword"] = "VR"
-    return p
-
-
-def fetch_all_vr_released_sorted_api() -> list[dict]:
-    all_items: list[dict] = []
-    for page in range(MAX_PAGES_API):
-        offset = 1 + page * HITS_API
-        print(f"[API] page {page+1} fetch (offset={offset}) with keyword=VR")
-        try:
-            res = dmm_request(_base_api_params(offset, use_keyword=True))
-            items = res.get("items", []) or []
-        except Exception as e:
-            print(f"[API] keyword=VR で失敗: {e} → keywordなしで再試行")
-            try:
-                res = dmm_request(_base_api_params(offset, use_keyword=False))
-                items = res.get("items", []) or []
-            except Exception as e2:
-                print(f"[API] keywordなしでも失敗: {e2} → 打ち切り")
-                break
-        print(f"[API] 取得件数: {len(items)}")
-        if not items:
-            break
-        all_items.extend(items)
-    released = [it for it in all_items if contains_vr(it) and is_released(it)]
-    released.sort(key=lambda x: x.get('date', ''), reverse=True)
-    print(f"[API] VR発売済み件数: {len(released)}（日付降順）")
-    return released
-
-
-def fetch_item_by_cid(cid: str) -> dict | None:
-    API_ID = get_env("DMM_API_ID")
-    AFF_ID = get_env("DMM_AFFILIATE_ID")
-    params = {
-        "api_id": API_ID,
-        "affiliate_id": AFF_ID,
-        "site": "FANZA",
-        "service": "digital",
-        "floor": "videoa",
-        "sort": "date",
-        "hits": 1,
-        "offset": 1,
-        "cid": cid,
-        "output": "json",
-    }
-    try:
-        res = dmm_request(params)
-        items = res.get("items") or []
-        return items[0] if items else None
-    except Exception as e:
-        print(f"CID={cid} のAPI取得失敗: {e}")
-        return None
-
-# ------------------ VR一覧スクレイプ ------------------
-
-def scrape_vr_cids(max_pages: int = VR_LIST_PAGES) -> list[str]:
-    """VR新着リストからCIDを抽出。
-    video側がJS描画で空を返すケースに備え、www側のリストも併用。
-    対象:
-      - https://video.dmm.co.jp/av/list/?media_type=vr&sort=date
-      - https://www.dmm.co.jp/digital/vrvideo/-/list/=/sort=date/
-      - https://www.dmm.co.jp/vrvideo/-/list/=/sort=date/
-    """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/123.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Referer": "https://www.dmm.co.jp/",
-    }
-    if AGE_GATE_COOKIE:
-        headers["Cookie"] = AGE_GATE_COOKIE
-
-    bases = [
-        # 先生指定：ジャンル=6548 / VR / 発売済み最新 / レコメンド順
-        "https://video.dmm.co.jp/av/list/?genre=6548&media_type=vr&release=latest&sort=suggest",
-        # 予備：旧来の新着一覧
-        "https://video.dmm.co.jp/av/list/?media_type=vr&sort=date",
-        # www 側（保険）
-        "https://www.dmm.co.jp/digital/vrvideo/-/list/=/sort=date/",
-        "https://www.dmm.co.jp/vrvideo/-/list/=/sort=date/",
-    ]
-
-    found: list[str] = []
-    pat_href = re.compile(r"(?:/detail/=/cid=|content/\?id=)([a-z0-9_]+)", re.I)
-    pat_data = re.compile(r"(?:data-cid=\"|\\\"cid\\\":\\\")(?:)([a-z0-9_]+)", re.I)
-
-    def _norm_cid(c: str) -> str:
-        return re.sub(r"[^a-z0-9_]", "", c.strip().lower())
-
-    def collect_from_html(txt: str):
-        cids = []
-        cids += pat_href.findall(txt)
-        cids += pat_data.findall(txt)
-        cids += re.findall(r"cid=([a-z0-9_]+)", txt, flags=re.I)
-        out_cids, seen = [], set()
-        for c in cids:
-            nc = _norm_cid(c)
-            if nc and nc not in seen:
-                seen.add(nc)
-                out_cids.append(nc)
-        return out_cids
-
-    for base in bases:
-        for p in range(1, max_pages + 1):
-            url = base + (f"?page={p}" if ("?" not in base and p > 1) else (f"&page={p}" if p > 1 else ""))
-            try:
-                r = requests.get(url, headers=headers, timeout=14)
-                if r.status_code != 200:
-                    print(f"VR一覧取得失敗: {r.status_code} {url}")
-                    break
-                txt = r.text
-                cids = collect_from_html(txt)
-                if not cids:
-                    print(f"CIDが見つかりません: {url}")
-                else:
-                    print(f"[VR一覧] {('www' if 'www.dmm.co.jp' in url else 'video')} page {p}: CID {len(cids)}件")
-                found.extend(cids)
-            except Exception as e:
-                print(f"VR一覧取得エラー: {e}")
-                break
-            time.sleep(0.25)
-
-    # 重複排除（上位=新しい方を優先）
-    seen, out = set(), []
-    for cid in found:
-        if cid not in seen:
-            seen.add(cid)
-            out.append(cid)
-    return out
-
-
-def fetch_released_from_vr_list() -> list[dict]:
-    print(f"VR一覧スクレイプ開始（pages={VR_LIST_PAGES}）")
-    cids = scrape_vr_cids(VR_LIST_PAGES)
-    if not cids:
-        print("一覧からCIDが取得できなかったため、APIフォールバックに切替（videoa/date）")
-        return fetch_all_vr_released_sorted_api()
-    items: list[dict] = []
-    for i, cid in enumerate(cids, 1):
-        it = fetch_item_by_cid(cid)
-        if it:
-            items.append(it)
-        if i % 10 == 0:
-            time.sleep(0.3)
-    released = [it for it in items if contains_vr(it) and is_released(it)]
-    released.sort(key=lambda x: x.get('date', ''), reverse=True)
-    print(f"VR発売済み件数: {len(released)}（一覧→API補完／日付降順）")
-    return released
-
-# ------------------ 分割（直近/バックログ） ------------------
-
-def split_recent_and_backlog(items: list[dict], recent_days: int = RECENT_DAYS) -> tuple[list[dict], list[dict]]:
-    boundary = now_jst() - timedelta(days=recent_days)
+# ===== 分割（直近/バックログ） =====
+def split_recent_and_backlog(items: list[dict]) -> tuple[list[dict], list[dict]]:
+    boundary = now_jst() - timedelta(days=RECENT_DAYS)
     recent, backlog = [], []
     for it in items:
         try:
@@ -548,8 +524,7 @@ def split_recent_and_backlog(items: list[dict], recent_days: int = RECENT_DAYS) 
             backlog.append(it)
     return recent, backlog
 
-# ------------------ メディア/投稿 ------------------
-
+# ===== メディア/投稿 =====
 def upload_image(wp: Client, url: str):
     try:
         data = requests.get(url, timeout=12).content
@@ -564,14 +539,11 @@ def upload_image(wp: Client, url: str):
 
 def create_wp_post(item: dict, wp: Client, category: str, aff_id: str) -> bool:
     title = item.get("title", "")
-
-    # 既投稿チェック（タイトル一致）
     existing = wp.call(GetPosts({"post_status": "publish", "s": title}))
     if any(p.title == title for p in existing):
         print(f"→ 既投稿: {title}（スキップ）")
         return False
 
-    # 画像
     images: list[str] = []
     siu = item.get("sampleImageURL", {}) or {}
     if "sample_l" in siu and "image" in siu["sample_l"]:
@@ -581,9 +553,9 @@ def create_wp_post(item: dict, wp: Client, category: str, aff_id: str) -> bool:
     if not images:
         print(f"→ サンプル画像なし: {title}（スキップ）")
         return False
+
     thumb_id = upload_image(wp, images[0]) if images else None
 
-    # タグ
     tags: set[str] = set()
     ii = item.get("iteminfo", {}) or {}
     for key in ("label", "maker", "actress", "genre"):
@@ -615,11 +587,28 @@ def create_wp_post(item: dict, wp: Client, category: str, aff_id: str) -> bool:
     print(f"✔ 投稿完了: {title}")
     return True
 
-# ------------------ メイン ------------------
+# ===== メイン =====
+def fetch_released_from_vr_list() -> list[dict]:
+    print(f"VR一覧スクレイプ開始（pages={VR_LIST_PAGES})")
+    cids = scrape_vr_cids(VR_LIST_PAGES)
+    if not cids:
+        print("一覧からCIDが取得できなかったため、APIフォールバックに切替（videoa/videoc）")
+        return fetch_all_vr_released_sorted_api()
+    items: list[dict] = []
+    for i, cid in enumerate(cids, 1):
+        it = fetch_item_by_cid(cid)
+        if it:
+            items.append(it)
+        if i % 10 == 0:
+            time.sleep(0.3)
+    released = [it for it in items if contains_vr(it) and is_released(it)]
+    released.sort(key=lambda x: x.get('date', ''), reverse=True)
+    print(f"VR発売済み件数: {len(released)}（一覧→API補完／日付降順）")
+    return released
+
 
 def main():
-    jst_now = now_jst()
-    print(f"[{jst_now.strftime('%Y-%m-%d %H:%M:%S')}] VR新着投稿開始（一覧スクレイプ→API補完／直近{RECENT_DAYS}日優先）")
+    print(f"[{now_jst().strftime('%Y-%m-%d %H:%M:%S')}] VR新着投稿開始（一覧スクレイプ→API補完／直近{RECENT_DAYS}日優先）")
     try:
         WP_URL = get_env('WP_URL').strip()
         WP_USER = get_env('WP_USER')
@@ -629,7 +618,7 @@ def main():
         wp = Client(WP_URL, WP_USER, WP_PASS)
 
         all_released = fetch_released_from_vr_list()
-        recent, backlog = split_recent_and_backlog(all_released, RECENT_DAYS)
+        recent, backlog = split_recent_and_backlog(all_released)
         print(f"直近{RECENT_DAYS}日: {len(recent)} / バックログ: {len(backlog)}")
 
         posted = 0
