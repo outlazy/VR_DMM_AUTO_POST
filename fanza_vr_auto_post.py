@@ -19,6 +19,7 @@ FANZA（DMM）VR新着 → WordPress自動投稿スクリプト
 
 # ====== 標準ライブラリ ======
 import html
+import json
 import os
 import re
 import time
@@ -99,16 +100,37 @@ class Config:
 
 # 説明文として採用する文字数の範囲
 DESC_MIN_LEN = 20
-DESC_MAX_LEN = 800
+DESC_MAX_LEN = 1200
 
-# スクレイピング時の説明文セレクタ候補（DMMページ構造に対応）
+# スクレイピング時の説明文セレクタ候補
+# video.dmm.co.jp（新UI）と www.dmm.co.jp（旧UI）の両方に対応
 DESC_SELECTORS = [
+    # ===== video.dmm.co.jp (新UI / React) =====
+    '[data-e2e="description"]',
+    '[data-e2e="summary"]',
+    '[data-testid="description"]',
+    '[data-testid="summary"]',
+    'div[class*="summary__txt"]',
+    'div[class*="Summary__text"]',
+    'div[class*="description"] p',
+    'p[class*="description"]',
+    'section[class*="summary"] p',
+    'section[class*="description"] p',
+    'div[class*="ProductDetail"] p',
+    'p[class*="text-overflow"]',
+    '[itemprop="description"]',
+    # ===== www.dmm.co.jp (旧UI) =====
     "div.mg-b20.lh4 p",
     "div.mg-b20.lh4",
     "p.mg-b20",
-    'meta[name="description"]',
+    # ===== 共通 =====
     'meta[property="og:description"]',
+    'meta[name="description"]',
+    'meta[name="twitter:description"]',
 ]
+
+# JSON-LDから説明文を取り出すときに見るキー
+JSONLD_DESC_KEYS = ("description", "abstract", "headline")
 
 
 # ============================================================
@@ -442,24 +464,99 @@ def _filter_urls_by_domain(urls: list[str]) -> list[str]:
     return preferred + others
 
 
+def _clean_text(text: str) -> str:
+    """空白・改行を整理した文字列を返す。"""
+    text = html.unescape(text or "")
+    text = re.sub(r"[​‌‍﻿]", "", text)  # ゼロ幅文字除去
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _is_valid_description(text: str) -> bool:
+    """説明文として妥当な長さ・内容か判定。"""
+    if not text:
+        return False
+    if not (DESC_MIN_LEN <= len(text) <= DESC_MAX_LEN):
+        return False
+    # 日本語文字が含まれていることを軽くチェック
+    return bool(re.search(r"[぀-ヿ一-鿿]", text))
+
+
+def _extract_from_selectors(soup: BeautifulSoup) -> Optional[str]:
+    """登録済みセレクタを順番に試して、最初に妥当な説明文を返す。"""
+    for selector in DESC_SELECTORS:
+        try:
+            elements = soup.select(selector)
+        except Exception:
+            continue
+        for element in elements:
+            if element.name == "meta":
+                text = _clean_text(element.get("content", ""))
+            else:
+                text = _clean_text(element.get_text(" ", strip=True))
+            if _is_valid_description(text):
+                return text
+    return None
+
+
+def _extract_from_jsonld(soup: BeautifulSoup) -> Optional[str]:
+    """JSON-LD（<script type="application/ld+json">）から説明文を抽出。"""
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = script.string or script.get_text() or ""
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        # 単体オブジェクトまたは配列に対応
+        candidates = data if isinstance(data, list) else [data]
+        for entry in candidates:
+            if not isinstance(entry, dict):
+                continue
+            for key in JSONLD_DESC_KEYS:
+                value = entry.get(key)
+                if isinstance(value, str):
+                    text = _clean_text(value)
+                    if _is_valid_description(text):
+                        return text
+    return None
+
+
+def _extract_longest_paragraph(soup: BeautifulSoup) -> Optional[str]:
+    """ヒューリスティック: 妥当な長さの中で最も長い p/div テキストを返す。"""
+    best: Optional[str] = None
+    for tag in soup.find_all(["p", "div"]):
+        text = _clean_text(tag.get_text(" ", strip=True))
+        if not _is_valid_description(text):
+            continue
+        if best is None or len(text) > len(best):
+            best = text
+    return best
+
+
 def _extract_description_from_html(html_text: str) -> Optional[str]:
-    """HTMLから説明文と思しきテキストを抽出する。"""
+    """HTMLから説明文と思しきテキストを抽出する（複数戦略で試行）。"""
     try:
         soup = BeautifulSoup(html_text, "lxml")
     except Exception:
         # lxmlが使えない環境では html.parser にフォールバック
         soup = BeautifulSoup(html_text, "html.parser")
 
-    for selector in DESC_SELECTORS:
-        elements = soup.select(selector)
-        for element in elements:
-            if element.name == "meta":
-                text = (element.get("content") or "").strip()
-            else:
-                text = element.get_text(" ", strip=True)
-            text = re.sub(r"\s+", " ", text)
-            if DESC_MIN_LEN <= len(text) <= DESC_MAX_LEN:
-                return text
+    # 戦略1: 既知のセレクタ
+    text = _extract_from_selectors(soup)
+    if text:
+        return text
+
+    # 戦略2: JSON-LD
+    text = _extract_from_jsonld(soup)
+    if text:
+        return text
+
+    # 戦略3: 最長のp/divテキスト
+    text = _extract_longest_paragraph(soup)
+    if text:
+        return text
+
     return None
 
 
