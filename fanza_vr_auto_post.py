@@ -2,339 +2,678 @@
 # -*- coding: utf-8 -*-
 
 """
-FANZA（DMM）VR新着 → WordPress自動投稿（APIフロア横断・VR超厳密判定・可用性チェック・1ファイル）
+FANZA（DMM）VR新着 → WordPress自動投稿スクリプト
+
+機能概要:
 - DMM Affiliate API を floor=videoa / videoc で横断取得
-- VR厳密判定：
+- VR厳密判定:
     A) URL: media_type=vr or /vrvideo/
     B) CID: *vrNN / dsvrNN など
     C) タイトルにVRトークン ＋ ジャンルにもVR系語彙
   → タイトルだけVRは除外
-- 発売判定は「日時」ではなく **可用性** で決定：
+- 発売判定は「日時」ではなく **可用性** で決定:
     1) サンプル画像の HEAD/GET が 200 かつ 10KB 以上
     2) 個別詳細ページ（video./www.）が 200
   どちらか満たさない場合は未公開扱いで除外（=前倒し防止）
 """
 
-import os, re, time, html, json, pytz, requests
+# ====== 標準ライブラリ ======
+import html
+import os
+import re
+import time
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from typing import Any, Iterable, Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+# ====== サードパーティ ======
+import pytz
+import requests
+from bs4 import BeautifulSoup
 
 # ====== collections.Iterable 互換パッチ（wordpress_xmlrpc 対策） ======
-import collections as _col
-import collections.abc as _abc
-for _n in ("Iterable", "Mapping", "MutableMapping", "Sequence"):
-    if not hasattr(_col, _n) and hasattr(_abc, _n):
-        setattr(_col, _n, getattr(_abc, _n))
+import collections as _collections
+import collections.abc as _collections_abc
+for _name in ("Iterable", "Mapping", "MutableMapping", "Sequence"):
+    if not hasattr(_collections, _name) and hasattr(_collections_abc, _name):
+        setattr(_collections, _name, getattr(_collections_abc, _name))
 
-# WordPress XMLRPC
 from wordpress_xmlrpc import Client, WordPressPost
-from wordpress_xmlrpc.methods import posts, media
-from wordpress_xmlrpc.methods.posts import GetPosts
 from wordpress_xmlrpc.compat import xmlrpc_client
+from wordpress_xmlrpc.methods import media, posts
+from wordpress_xmlrpc.methods.posts import GetPosts
 
-# ------------------ 環境設定 ------------------
+
+# ============================================================
+# 定数・設定
+# ============================================================
 DMM_API_URL = "https://api.dmm.com/affiliate/v3/ItemList"
-POST_LIMIT = int(os.getenv("POST_LIMIT", "2"))
-RECENT_DAYS = int(os.getenv("RECENT_DAYS", "3"))
-HITS = int(os.getenv("HITS", "30"))
-MAX_PAGES = int(os.getenv("MAX_PAGES", "6"))
-FLOORS = os.getenv("FLOORS", "videoa,videoc").split(",")
-AGE_GATE_COOKIE = os.getenv("AGE_GATE_COOKIE", "").strip()  # 例: "ckcy=1; age_check_done=1"
+JST = pytz.timezone("Asia/Tokyo")
 
-# ------------------ ユーティリティ ------------------
-def now_jst():
-    return datetime.now(pytz.timezone("Asia/Tokyo"))
+# HTTPタイムアウト（秒）
+HEAD_TIMEOUT = 10
+GET_TIMEOUT = 12
+API_TIMEOUT = 15
 
-def parse_jst_date(s: str):
-    jst = pytz.timezone("Asia/Tokyo")
-    s = (s or "").strip()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+# 画像可用性判定の閾値
+MIN_IMAGE_BYTES = 10 * 1024      # 10KB 以上で「実体あり」とみなす
+IMAGE_PROBE_BYTES = 16 * 1024    # 確認用に読み込む最大バイト数
+IMAGE_CHUNK_SIZE = 4096
+MAX_IMAGES_TO_CHECK = 2          # 先頭から何枚まで可用性チェックするか
+
+# APIリクエスト間のスリープ（秒）
+API_SLEEP_SECONDS = 0.2
+
+# 日付フォーマット候補
+DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d")
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"
+)
+
+# VR判定用トークン
+VR_TITLE_KEYWORDS = ["【VR】", "VR専用", "8K VR", "8KVR", "ハイクオリティVR"]
+VR_GENRE_WORDS = [
+    "VR", "ＶＲ", "VR専用", "8KVR", "8K VR",
+    "ハイクオリティVR", "VR動画", "VR作品",
+]
+VR_CID_PATTERN = re.compile(r"(?:^|[^a-z])(dsvr|idvr|[a-z]*vr)\d{2,}")
+VR_TITLE_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9])VR(?![A-Za-z0-9])")
+
+
+class Config:
+    """環境変数から取得する実行時設定。"""
+
+    POST_LIMIT = int(os.getenv("POST_LIMIT", "2"))
+    RECENT_DAYS = int(os.getenv("RECENT_DAYS", "3"))
+    HITS = int(os.getenv("HITS", "30"))
+    MAX_PAGES = int(os.getenv("MAX_PAGES", "6"))
+    FLOORS = [f.strip() for f in os.getenv("FLOORS", "videoa,videoc").split(",") if f.strip()]
+    AGE_GATE_COOKIE = os.getenv("AGE_GATE_COOKIE", "").strip()
+    # 詳細ページから説明文をスクレイピングするか（"1" で有効）
+    SCRAPE_DESC = os.getenv("SCRAPE_DESC", "0") == "1"
+    # 詳細ページ取得時の優先ドメイン（"www" / "video" / "" のいずれか）
+    FORCE_DETAIL_DOMAIN = os.getenv("FORCE_DETAIL_DOMAIN", "").strip().lower()
+
+
+# 説明文として採用する文字数の範囲
+DESC_MIN_LEN = 20
+DESC_MAX_LEN = 800
+
+# スクレイピング時の説明文セレクタ候補（DMMページ構造に対応）
+DESC_SELECTORS = [
+    "div.mg-b20.lh4 p",
+    "div.mg-b20.lh4",
+    "p.mg-b20",
+    'meta[name="description"]',
+    'meta[property="og:description"]',
+]
+
+
+# ============================================================
+# 共通ユーティリティ
+# ============================================================
+def now_jst() -> datetime:
+    """日本時間の現在時刻を返す。"""
+    return datetime.now(JST)
+
+
+def parse_jst_date(value: str) -> datetime:
+    """文字列をJSTのdatetimeにパース。失敗時は1970-01-01を返す。"""
+    text = (value or "").strip()
+    for fmt in DATE_FORMATS:
         try:
-            return jst.localize(datetime.strptime(s, fmt))
+            return JST.localize(datetime.strptime(text, fmt))
         except ValueError:
-            pass
-    return jst.localize(datetime(1970,1,1))
+            continue
+    return JST.localize(datetime(1970, 1, 1))
 
-def get_env(key, required=True):
-    v = os.getenv(key)
-    if required and not v:
+
+def get_env(key: str, required: bool = True) -> Optional[str]:
+    """環境変数を取得。required=True で未設定なら例外。"""
+    value = os.getenv(key)
+    if required and not value:
         raise RuntimeError(f"環境変数 {key} が未設定です")
-    return v
+    return value
 
-def make_affiliate_link(url: str, aff_id: str) -> str:
-    pu = urlparse(url)
-    q = dict(parse_qsl(pu.query))
-    q["affiliate_id"] = aff_id
-    return urlunparse((pu.scheme, pu.netloc, pu.path, pu.params, urlencode(q), pu.fragment))
 
-# ------------------ VR判定（超厳密） ------------------
-def _has_vr_token_in_title(title: str) -> bool:
-    return bool(re.search(r"(?<![A-Za-z0-9])VR(?![A-Za-z0-9])", title or "")) or any(
-        kw in (title or "") for kw in ["【VR】", "VR専用", "8K VR", "8KVR", "ハイクオリティVR"]
+def make_affiliate_link(url: str, affiliate_id: str) -> str:
+    """URLにアフィリエイトIDを付与して返す。"""
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query))
+    query["affiliate_id"] = affiliate_id
+    return urlunparse((
+        parsed.scheme, parsed.netloc, parsed.path,
+        parsed.params, urlencode(query), parsed.fragment,
+    ))
+
+
+def join_names(entries: Iterable[Any]) -> str:
+    """[{'name': ...}, ...] 形式のリストから名前を「、」で連結。"""
+    return "、".join(
+        entry.get("name", "") for entry in entries if isinstance(entry, dict)
     )
 
-def _genre_has_vr_words(iteminfo: dict) -> bool:
-    names = [x.get("name","") for x in (iteminfo or {}).get("genre",[]) if isinstance(x,dict)]
-    joined = " ".join(names)
-    vr_words = ["VR", "ＶＲ", "VR専用", "8KVR", "8K VR", "ハイクオリティVR", "VR動画", "VR作品"]
-    return any(re.search(rf"(?<![A-Za-z0-9]){re.escape(w)}(?![A-Za-z0-9])", joined) for w in vr_words)
 
-def contains_vr(item: dict) -> bool:
-    # A) URL
+def extract_sample_images(item: dict) -> list[str]:
+    """アイテムからサンプル画像URLのリストを抽出（large優先、small次点）。"""
+    sample_url = item.get("sampleImageURL") or {}
+    large = (sample_url.get("sample_l") or {}).get("image") or []
+    small = (sample_url.get("sample_s") or {}).get("image") or []
+    return large or small or []
+
+
+# ============================================================
+# VR判定（超厳密）
+# ============================================================
+def _has_vr_token_in_title(title: str) -> bool:
+    """タイトル中に独立したVRトークンまたは特定キーワードがあるか。"""
+    title = title or ""
+    if VR_TITLE_TOKEN_PATTERN.search(title):
+        return True
+    return any(keyword in title for keyword in VR_TITLE_KEYWORDS)
+
+
+def _genre_has_vr_words(iteminfo: dict) -> bool:
+    """ジャンル名にVR系語彙が含まれるか。"""
+    genres = (iteminfo or {}).get("genre", [])
+    joined = " ".join(g.get("name", "") for g in genres if isinstance(g, dict))
+    return any(
+        re.search(rf"(?<![A-Za-z0-9]){re.escape(word)}(?![A-Za-z0-9])", joined)
+        for word in VR_GENRE_WORDS
+    )
+
+
+def _url_indicates_vr(url: str) -> bool:
+    """URLからVR作品であることを判定。"""
     try:
-        u = item.get("URL", "")
-        pu = urlparse(u)
-        q = dict(parse_qsl(pu.query))
-        if q.get("media_type","").lower() == "vr":
+        parsed = urlparse(url)
+        query = dict(parse_qsl(parsed.query))
+        if query.get("media_type", "").lower() == "vr":
             return True
-        if "/vrvideo/" in pu.path:
+        if "/vrvideo/" in parsed.path:
             return True
     except Exception:
         pass
-    # B) CID
+    return False
+
+
+def _cid_indicates_vr(item: dict) -> bool:
+    """CID（コンテンツID）の命名規則からVRを判定。"""
     cid = (item.get("content_id") or item.get("product_id") or "").lower()
-    if re.search(r"(?:^|[^a-z])(dsvr|idvr|[a-z]*vr)\d{2,}", cid):
+    return bool(VR_CID_PATTERN.search(cid))
+
+
+def contains_vr(item: dict) -> bool:
+    """3つの判定基準（URL/CID/タイトル+ジャンル）でVR作品か判定。"""
+    if _url_indicates_vr(item.get("URL", "")):
         return True
-    # C) タイトル + ジャンル
-    if _has_vr_token_in_title(item.get("title","")) and _genre_has_vr_words(item.get("iteminfo",{}) or {}):
+    if _cid_indicates_vr(item):
+        return True
+    if (
+        _has_vr_token_in_title(item.get("title", ""))
+        and _genre_has_vr_words(item.get("iteminfo") or {})
+    ):
         return True
     return False
 
-# ------------------ 可用性（発売済み相当）判定 ------------------
-def _headers_for_html():
-    h = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+
+# ============================================================
+# 可用性（発売済み相当）判定
+# ============================================================
+def _headers_for_html() -> dict[str, str]:
+    """HTMLページ取得用のHTTPヘッダを返す。"""
+    headers = {
+        "User-Agent": USER_AGENT,
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
         "Referer": "https://video.dmm.co.jp/",
     }
-    if AGE_GATE_COOKIE:
-        h["Cookie"] = AGE_GATE_COOKIE
-    return h
+    if Config.AGE_GATE_COOKIE:
+        headers["Cookie"] = Config.AGE_GATE_COOKIE
+    return headers
+
 
 def _candidate_detail_urls(item: dict) -> list[str]:
+    """個別詳細ページの候補URLを重複排除して返す。"""
     cid = (item.get("content_id") or item.get("product_id") or "").strip().lower()
-    u = item.get("URL","")
-    urls = []
+    item_url = item.get("URL", "")
+
+    candidates: list[str] = []
     if cid:
-        urls = [
+        candidates.extend([
             f"https://video.dmm.co.jp/av/content/?id={cid}",
             f"https://www.dmm.co.jp/digital/vrvideo/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/vrvideo/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/digital/videoa/-/detail/=/cid={cid}/",
-        ]
-    if u:
-        urls.append(u)
-    out, seen = [], set()
-    for x in urls:
-        if x not in seen:
-            seen.add(x); out.append(x)
-    return out
+        ])
+    if item_url:
+        candidates.append(item_url)
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for url in candidates:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
+    return unique
+
+
+def _is_success_status(status_code: int) -> bool:
+    """HTTPステータスが2xxか判定。"""
+    return 200 <= status_code < 300
+
 
 def _url_ok(url: str) -> bool:
+    """URLが取得可能（2xx）か判定。HEAD不可なら GETでフォールバック。"""
     try:
-        r = requests.head(url, headers=_headers_for_html(), timeout=10, allow_redirects=True)
-        if r.status_code == 405:  # HEAD不可サイト
-            r = requests.get(url, headers=_headers_for_html(), timeout=12, allow_redirects=True, stream=True)
-        return 200 <= r.status_code < 300
+        response = requests.head(
+            url, headers=_headers_for_html(),
+            timeout=HEAD_TIMEOUT, allow_redirects=True,
+        )
+        if response.status_code == 405:  # HEAD不可サイト
+            response = requests.get(
+                url, headers=_headers_for_html(),
+                timeout=GET_TIMEOUT, allow_redirects=True, stream=True,
+            )
+        return _is_success_status(response.status_code)
     except Exception:
         return False
+
+
+def _measure_streamed_size(response: requests.Response, max_bytes: int) -> int:
+    """ストリーミングレスポンスから最大 max_bytes まで読み込み、読み込んだサイズを返す。"""
+    size = 0
+    for chunk in response.iter_content(IMAGE_CHUNK_SIZE):
+        size += len(chunk)
+        if size >= max_bytes:
+            break
+    return size
+
 
 def _image_ok(url: str) -> bool:
+    """画像URLが2xx かつ MIN_IMAGE_BYTES 以上のサイズか判定。"""
     try:
-        # まず HEAD
-        r = requests.head(url, timeout=10, allow_redirects=True)
-        if r.status_code == 405 or r.headers.get("content-length") in (None, "0"):
-            # HEAD不可やサイズ不明は GET でサイズ確認（最初の ~16KB 読む）
-            r = requests.get(url, timeout=12, allow_redirects=True, stream=True)
-            size = 0
-            for chunk in r.iter_content(4096):
-                size += len(chunk)
-                if size >= 16384:
-                    break
-            ok = 200 <= r.status_code < 300 and size >= 10240
-            return ok
-        # content-length が 10KB 以上
+        response = requests.head(url, timeout=HEAD_TIMEOUT, allow_redirects=True)
+
+        # HEAD不可 or サイズ不明 → GETで実体サイズを確認
+        if response.status_code == 405 or response.headers.get("content-length") in (None, "0"):
+            response = requests.get(url, timeout=GET_TIMEOUT, allow_redirects=True, stream=True)
+            size = _measure_streamed_size(response, IMAGE_PROBE_BYTES)
+            return _is_success_status(response.status_code) and size >= MIN_IMAGE_BYTES
+
+        # Content-Length で判定
         try:
-            cl = int(r.headers.get("content-length","0"))
+            content_length = int(response.headers.get("content-length", "0"))
         except ValueError:
-            cl = 0
-        return 200 <= r.status_code < 300 and cl >= 10240
+            content_length = 0
+        return _is_success_status(response.status_code) and content_length >= MIN_IMAGE_BYTES
     except Exception:
         return False
 
-def is_available_now(item: dict) -> bool:
-    """
-    “前倒し禁止”のための可用性判定。
-    - サンプル画像の実体が取得可能（>=10KB）
-    - 詳細ページのHTTP 200
-    両方OKで True。どちらか欠けたら False。
-    """
-    # 画像チェック
-    siu = item.get("sampleImageURL") or {}
-    imgs = (siu.get("sample_l",{}) or {}).get("image") or (siu.get("sample_s",{}) or {}).get("image") or []
-    img_ok = False
-    for im in imgs[:2]:  # 最初の2枚で十分
-        if _image_ok(im):
-            img_ok = True
-            break
-    if not img_ok:
-        return False
 
-    # 詳細ページチェック
-    for du in _candidate_detail_urls(item):
-        if _url_ok(du):
+def _any_image_available(images: list[str]) -> bool:
+    """先頭から MAX_IMAGES_TO_CHECK 枚までを確認し、いずれか可用なら True。"""
+    for image_url in images[:MAX_IMAGES_TO_CHECK]:
+        if _image_ok(image_url):
             return True
     return False
 
-# ------------------ DMM API ------------------
+
+def _any_detail_page_available(item: dict) -> bool:
+    """詳細ページ候補のうちいずれか1つでも200ならTrue。"""
+    return any(_url_ok(url) for url in _candidate_detail_urls(item))
+
+
+def is_available_now(item: dict) -> bool:
+    """
+    "前倒し禁止" のための可用性判定。
+
+    以下を両方満たす場合のみ True:
+      - サンプル画像の実体が取得可能（>= MIN_IMAGE_BYTES）
+      - 詳細ページが HTTP 200
+    """
+    images = extract_sample_images(item)
+    if not _any_image_available(images):
+        return False
+    return _any_detail_page_available(item)
+
+
+# ============================================================
+# DMM API
+# ============================================================
 def dmm_request(params: dict) -> dict:
-    r = requests.get(DMM_API_URL, params=params, timeout=15)
-    if r.status_code != 200:
-        print(f"[API] Error {r.status_code}: {r.text[:200]}")
+    """DMM ItemList API を呼び出し、result 部分を返す。失敗時は空dict。"""
+    try:
+        response = requests.get(DMM_API_URL, params=params, timeout=API_TIMEOUT)
+    except requests.RequestException as e:
+        print(f"[API] リクエスト失敗: {e}")
         return {}
-    data = r.json()
+
+    if response.status_code != 200:
+        print(f"[API] Error {response.status_code}: {response.text[:200]}")
+        return {}
+
+    data = response.json()
     return data.get("result", {}) or {}
 
-def base_params(offset: int, floor: str, use_keyword=True) -> dict:
-    base = {
+
+def base_params(offset: int, floor: str, use_keyword: bool = True) -> dict:
+    """ItemList API の共通パラメータを生成。"""
+    params = {
         "api_id": get_env("DMM_API_ID"),
         "affiliate_id": get_env("DMM_AFFILIATE_ID"),
         "site": "FANZA",
         "service": "digital",
-        "floor": floor,      # videoa / videoc
+        "floor": floor,        # videoa / videoc
         "sort": "date",
         "output": "json",
-        "hits": HITS,
-        "offset": offset,    # 1起点
+        "hits": Config.HITS,
+        "offset": offset,      # 1起点
     }
     if use_keyword:
-        base["keyword"] = "VR"
-    return base
+        params["keyword"] = "VR"
+    return params
+
+
+def _fetch_floor_items(floor: str) -> list[dict]:
+    """指定フロアからページネーション込みでアイテムを取得。"""
+    items: list[dict] = []
+    for page in range(Config.MAX_PAGES):
+        offset = 1 + page * Config.HITS
+        print(f"[API] floor={floor} page={page + 1} offset={offset}")
+        result = dmm_request(base_params(offset, floor, use_keyword=True))
+        page_items = result.get("items", []) or []
+        print(f"[API] 取得 {len(page_items)} 件")
+        if not page_items:
+            break
+        items.extend(page_items)
+        time.sleep(API_SLEEP_SECONDS)
+    return items
+
 
 def fetch_vr_items_from_floors() -> list[dict]:
-    print("[API] フロア横断取得開始 →", ",".join(FLOORS))
-    raw = []
-    for floor in FLOORS:
-        for page in range(MAX_PAGES):
-            offset = 1 + page * HITS
-            print(f"[API] floor={floor} page={page+1} offset={offset}")
-            res = dmm_request(base_params(offset, floor, True))
-            items = res.get("items", []) or []
-            print(f"[API] 取得 {len(items)} 件")
-            if not items:
-                break
-            raw.extend(items)
-            time.sleep(0.2)
+    """全フロアから取得 → VR判定 → 可用性チェックを実施し、新しい順で返す。"""
+    print("[API] フロア横断取得開始 →", ",".join(Config.FLOORS))
 
-    # VR作品のみ
-    vr_items = [it for it in raw if contains_vr(it)]
+    raw_items: list[dict] = []
+    for floor in Config.FLOORS:
+        raw_items.extend(_fetch_floor_items(floor))
+
+    # VR作品のみに絞り込み
+    vr_items = [item for item in raw_items if contains_vr(item)]
+
     # 可用性（発売済み相当）フィルタ
-    available = []
-    for it in vr_items:
-        ok = is_available_now(it)
-        print(f"  - [{ 'OK' if ok else 'NG' }] {it.get('title','')}")
+    available: list[dict] = []
+    for item in vr_items:
+        ok = is_available_now(item)
+        print(f"  - [{'OK' if ok else 'NG'}] {item.get('title', '')}")
         if ok:
-            available.append(it)
+            available.append(item)
 
-    print(f"[API] 総取得: {len(raw)} / VR判定: {len(vr_items)} / 可用性OK: {len(available)}")
-    available.sort(key=lambda x: x.get("date",""), reverse=True)
+    print(
+        f"[API] 総取得: {len(raw_items)} / "
+        f"VR判定: {len(vr_items)} / 可用性OK: {len(available)}"
+    )
+    available.sort(key=lambda x: x.get("date", ""), reverse=True)
     return available
 
-# ------------------ 本文フォールバック ------------------
-def fallback_description(item: dict) -> str:
-    ii = item.get("iteminfo", {}) or {}
-    for key in ("description","comment","story"):
-        v = (item.get(key) or ii.get(key) or "").strip()
-        if 20 <= len(v) <= 800:
-            return html.unescape(v)
-    cast  = "、".join([a.get("name","") for a in ii.get("actress",[]) if isinstance(a,dict)])
-    label = "、".join([l.get("name","") for l in ii.get("label",[])   if isinstance(l,dict)])
-    genres= "、".join([g.get("name","") for g in ii.get("genre",[])   if isinstance(g,dict)])
-    series= "、".join([s.get("name","") for s in ii.get("series",[])  if isinstance(s,dict)])
-    maker = "、".join([m.get("name","") for m in ii.get("maker",[])   if isinstance(m,dict)])
-    title = item.get("title","")
-    vol   = item.get("volume","")
-    base  = f"{title}。ジャンル：{genres}。出演：{cast}。シリーズ：{series}。メーカー：{maker}。レーベル：{label}。収録時間：{vol}。"
-    return base if len(base) > 10 else "FANZA（DMM）VR作品の自動紹介です。"
 
-# ------------------ WordPress投稿 ------------------
-def upload_image(wp: Client, url: str):
+# ============================================================
+# 本文フォールバック
+# ============================================================
+def _pick_existing_description(item: dict) -> Optional[str]:
+    """item から既存の説明文を探す（DESC_MIN_LEN〜DESC_MAX_LEN文字の範囲）。"""
+    iteminfo = item.get("iteminfo") or {}
+    for key in ("description", "comment", "story"):
+        value = (item.get(key) or iteminfo.get(key) or "").strip()
+        if DESC_MIN_LEN <= len(value) <= DESC_MAX_LEN:
+            return html.unescape(value)
+    return None
+
+
+def _filter_urls_by_domain(urls: list[str]) -> list[str]:
+    """FORCE_DETAIL_DOMAIN が指定されていれば、対応するドメインのURLを優先。"""
+    domain = Config.FORCE_DETAIL_DOMAIN
+    if not domain:
+        return urls
+    preferred = [u for u in urls if f"{domain}.dmm.co.jp" in u]
+    others = [u for u in urls if u not in preferred]
+    return preferred + others
+
+
+def _extract_description_from_html(html_text: str) -> Optional[str]:
+    """HTMLから説明文と思しきテキストを抽出する。"""
     try:
-        data = requests.get(url, timeout=12).content
+        soup = BeautifulSoup(html_text, "lxml")
+    except Exception:
+        # lxmlが使えない環境では html.parser にフォールバック
+        soup = BeautifulSoup(html_text, "html.parser")
+
+    for selector in DESC_SELECTORS:
+        elements = soup.select(selector)
+        for element in elements:
+            if element.name == "meta":
+                text = (element.get("content") or "").strip()
+            else:
+                text = element.get_text(" ", strip=True)
+            text = re.sub(r"\s+", " ", text)
+            if DESC_MIN_LEN <= len(text) <= DESC_MAX_LEN:
+                return text
+    return None
+
+
+def scrape_description(item: dict) -> Optional[str]:
+    """詳細ページから説明文をスクレイピングする。SCRAPE_DESCが無効なら何もしない。"""
+    if not Config.SCRAPE_DESC:
+        return None
+
+    urls = _filter_urls_by_domain(_candidate_detail_urls(item))
+    for url in urls:
+        try:
+            response = requests.get(
+                url, headers=_headers_for_html(),
+                timeout=GET_TIMEOUT, allow_redirects=True,
+            )
+            if not _is_success_status(response.status_code):
+                continue
+            response.encoding = response.apparent_encoding or response.encoding
+            description = _extract_description_from_html(response.text)
+            if description:
+                return description
+        except Exception as e:
+            print(f"[スクレイピング失敗] {url}: {e}")
+            continue
+    return None
+
+
+def _compose_metadata_description(item: dict) -> str:
+    """メタ情報から説明文を組み立てる。"""
+    iteminfo = item.get("iteminfo") or {}
+    cast = join_names(iteminfo.get("actress", []))
+    label = join_names(iteminfo.get("label", []))
+    genres = join_names(iteminfo.get("genre", []))
+    series = join_names(iteminfo.get("series", []))
+    maker = join_names(iteminfo.get("maker", []))
+    title = item.get("title", "")
+    volume = item.get("volume", "")
+
+    description = (
+        f"{title}。ジャンル：{genres}。出演：{cast}。"
+        f"シリーズ：{series}。メーカー：{maker}。"
+        f"レーベル：{label}。収録時間：{volume}。"
+    )
+    return description if len(description) > 10 else "FANZA（DMM）VR作品の自動紹介です。"
+
+
+def fallback_description(item: dict) -> str:
+    """
+    投稿本文用の説明テキストを生成。優先順位:
+      1. APIレスポンス内の既存説明文
+      2. 詳細ページからスクレイピングした説明文（SCRAPE_DESC=1のとき）
+      3. メタ情報から自動生成
+    """
+    existing = _pick_existing_description(item)
+    if existing:
+        return existing
+
+    scraped = scrape_description(item)
+    if scraped:
+        return scraped
+
+    return _compose_metadata_description(item)
+
+
+# ============================================================
+# WordPress投稿
+# ============================================================
+def upload_image(wp: Client, url: str) -> Optional[dict]:
+    """
+    画像をWPメディアにアップロードし、レスポンス（id, url, file, type など）を返す。
+    失敗時 None。
+    """
+    try:
+        data = requests.get(url, timeout=GET_TIMEOUT).content
         name = os.path.basename(url.split("?")[0])
         return wp.call(media.UploadFile({
             "name": name,
             "type": "image/jpeg",
-            "bits": xmlrpc_client.Binary(data)
-        }))["id"]
+            "bits": xmlrpc_client.Binary(data),
+        }))
     except Exception as e:
-        print(f"[画像アップロード失敗] {e}")
+        print(f"[画像アップロード失敗] {url}: {e}")
         return None
 
-def create_wp_post(item: dict, wp: Client, category: str, aff_id: str) -> bool:
+
+def _upload_all_images(wp: Client, image_urls: list[str]) -> list[dict]:
+    """画像URLリストをすべてWPにアップロード。失敗したものはスキップして残りを返す。"""
+    uploaded: list[dict] = []
+    for index, url in enumerate(image_urls, start=1):
+        result = upload_image(wp, url)
+        if result:
+            print(f"  [画像 {index}/{len(image_urls)}] アップロード成功 → {result.get('url', '')}")
+            uploaded.append(result)
+        else:
+            print(f"  [画像 {index}/{len(image_urls)}] アップロード失敗（スキップ）")
+    return uploaded
+
+
+def _is_already_posted(wp: Client, title: str) -> bool:
+    """同じタイトルの公開済み投稿があるか確認。"""
+    try:
+        existing = wp.call(GetPosts({"post_status": "publish", "s": title}))
+        return any(post.title == title for post in existing)
+    except Exception as e:
+        print(f"[既投稿チェック失敗] {e}")
+        return False
+
+
+def _build_post_content(
+    title: str,
+    affiliate_link: str,
+    images: list[str],
+    description: str,
+) -> str:
+    """投稿本文HTMLを組み立てる。"""
+    affiliate_tag_attrs = 'target="_blank" rel="nofollow noopener"'
+
+    parts = [
+        f'<p><a href="{affiliate_link}" {affiliate_tag_attrs}>'
+        f'<img src="{images[0]}" alt="{title}"></a></p>',
+        f'<p><a href="{affiliate_link}" {affiliate_tag_attrs}>{title}</a></p>',
+        f'<div>{description}</div>',
+    ]
+    parts.extend(
+        f'<p><img src="{img}" alt="{title}"></p>' for img in images[1:]
+    )
+    parts.append(
+        f'<p><a href="{affiliate_link}" {affiliate_tag_attrs}>{title}</a></p>'
+    )
+    return "\n".join(parts)
+
+
+def create_wp_post(item: dict, wp: Client, category: str, affiliate_id: str) -> bool:
+    """1件のVR作品をWordPressに投稿。成功時 True。"""
     title = item.get("title", "").strip()
+
+    # VR再チェック（保険）
     if not contains_vr(item):
         print(f"→ 非VRスキップ: {title}")
         return False
 
-    try:
-        exist = wp.call(GetPosts({"post_status": "publish", "s": title}))
-        if any(p.title == title for p in exist):
-            print(f"→ 既投稿: {title}")
-            return False
-    except Exception as e:
-        print(f"[既投稿チェック失敗] {e}")
+    # 重複投稿チェック
+    if _is_already_posted(wp, title):
+        print(f"→ 既投稿: {title}")
+        return False
 
-    siu = item.get("sampleImageURL") or {}
-    images = siu.get("sample_l", {}).get("image") or siu.get("sample_s", {}).get("image") or []
-    if not images:
+    # 画像チェック
+    source_images = extract_sample_images(item)
+    if not source_images:
         print(f"→ 画像なしスキップ: {title}")
         return False
-    thumb_id = upload_image(wp, images[0])
 
-    aff_link = make_affiliate_link(item["URL"], aff_id)
-    desc = fallback_description(item)
+    # 全画像をWPメディアにアップロード
+    print(f"[画像アップロード開始] {title} （{len(source_images)}枚）")
+    uploaded = _upload_all_images(wp, source_images)
+    if not uploaded:
+        print(f"→ 全画像アップロード失敗スキップ: {title}")
+        return False
 
-    parts = [
-        f'<p><a href="{aff_link}" target="_blank" rel="nofollow noopener"><img src="{images[0]}" alt="{title}"></a></p>',
-        f'<p><a href="{aff_link}" target="_blank" rel="nofollow noopener">{title}</a></p>',
-        f'<div>{desc}</div>',
-    ] + [f'<p><img src="{img}" alt="{title}"></p>' for img in images[1:]] + [
-        f'<p><a href="{aff_link}" target="_blank" rel="nofollow noopener">{title}</a></p>'
-    ]
+    # 1枚目をサムネイルに、本文では全画像をWP側のURLで参照
+    thumbnail_id = uploaded[0]["id"]
+    wp_image_urls = [u["url"] for u in uploaded if u.get("url")]
 
+    # 本文組み立て
+    affiliate_link = make_affiliate_link(item["URL"], affiliate_id)
+    description = fallback_description(item)
+    content = _build_post_content(title, affiliate_link, wp_image_urls, description)
+
+    # 投稿
     post = WordPressPost()
     post.title = title
-    post.content = "\n".join(parts)
-    if thumb_id: post.thumbnail = thumb_id
+    post.content = content
+    if thumbnail_id:
+        post.thumbnail = thumbnail_id
     post.terms_names = {"category": [category]}
     post.post_status = "publish"
     wp.call(posts.NewPost(post))
-    print(f"✔ 投稿完了: {title}")
+
+    print(f"✔ 投稿完了: {title} （画像 {len(uploaded)}/{len(source_images)} 枚）")
     return True
 
-# ------------------ メイン ------------------
-def main():
-    print(f"[{now_jst()}] VR新着投稿開始（VR超厳密＋可用性チェック）")
-    wp = Client(get_env("WP_URL"), get_env("WP_USER"), get_env("WP_PASS"))
-    cat = get_env("CATEGORY")
-    aff = get_env("DMM_AFFILIATE_ID")
 
-    items = fetch_vr_items_from_floors()
-    # 一応、直近優先ロジックは残す
-    boundary = now_jst() - timedelta(days=RECENT_DAYS)
+# ============================================================
+# メイン
+# ============================================================
+def _split_recent_and_backlog(items: list[dict]) -> tuple[list[dict], list[dict]]:
+    """直近N日のアイテムとそれ以外に分割。"""
+    boundary = now_jst() - timedelta(days=Config.RECENT_DAYS)
     recent = [i for i in items if parse_jst_date(i.get("date", "")) >= boundary]
     backlog = [i for i in items if i not in recent]
-    print(f"直近{RECENT_DAYS}日: {len(recent)} / バックログ: {len(backlog)}")
+    return recent, backlog
+
+
+def main() -> None:
+    print(f"[{now_jst()}] VR新着投稿開始（VR超厳密＋可用性チェック）")
+
+    wp = Client(get_env("WP_URL"), get_env("WP_USER"), get_env("WP_PASS"))
+    category = get_env("CATEGORY")
+    affiliate_id = get_env("DMM_AFFILIATE_ID")
+
+    items = fetch_vr_items_from_floors()
+    recent, backlog = _split_recent_and_backlog(items)
+    print(f"直近{Config.RECENT_DAYS}日: {len(recent)} / バックログ: {len(backlog)}")
 
     posted = 0
-    for it in recent + backlog:
-        if create_wp_post(it, wp, cat, aff):
+    for item in recent + backlog:
+        if create_wp_post(item, wp, category, affiliate_id):
             posted += 1
-            if posted >= POST_LIMIT:
+            if posted >= Config.POST_LIMIT:
                 break
+
     print(f"投稿数: {posted}")
     print(f"[{now_jst()}] 終了")
+
 
 if __name__ == "__main__":
     main()
