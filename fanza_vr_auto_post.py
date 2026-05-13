@@ -24,7 +24,7 @@ import os
 import re
 import time
 from datetime import datetime, timedelta
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Iterator, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 # ====== サードパーティ ======
@@ -88,8 +88,8 @@ class Config:
 
     POST_LIMIT = int(os.getenv("POST_LIMIT", "2"))
     RECENT_DAYS = int(os.getenv("RECENT_DAYS", "3"))
-    HITS = int(os.getenv("HITS", "30"))
-    MAX_PAGES = int(os.getenv("MAX_PAGES", "6"))
+    HITS = int(os.getenv("HITS", "20"))
+    MAX_PAGES = int(os.getenv("MAX_PAGES", "3"))
     FLOORS = [f.strip() for f in os.getenv("FLOORS", "videoa,videoc").split(",") if f.strip()]
     AGE_GATE_COOKIE = os.getenv("AGE_GATE_COOKIE", "").strip()
     # 詳細ページから説明文をスクレイピングするか（"1" で有効）
@@ -398,9 +398,8 @@ def base_params(offset: int, floor: str, use_keyword: bool = True) -> dict:
     return params
 
 
-def _fetch_floor_items(floor: str) -> list[dict]:
-    """指定フロアからページネーション込みでアイテムを取得。"""
-    items: list[dict] = []
+def _iter_floor_pages(floor: str) -> Iterator[list[dict]]:
+    """指定フロアのページを1ページずつ遅延取得する。"""
     for page in range(Config.MAX_PAGES):
         offset = 1 + page * Config.HITS
         print(f"[API] floor={floor} page={page + 1} offset={offset}")
@@ -408,37 +407,39 @@ def _fetch_floor_items(floor: str) -> list[dict]:
         page_items = result.get("items", []) or []
         print(f"[API] 取得 {len(page_items)} 件")
         if not page_items:
-            break
-        items.extend(page_items)
+            return
+        yield page_items
         time.sleep(API_SLEEP_SECONDS)
-    return items
 
 
-def fetch_vr_items_from_floors() -> list[dict]:
-    """全フロアから取得 → VR判定 → 可用性チェックを実施し、新しい順で返す。"""
+def iter_vr_available_items() -> Iterator[dict]:
+    """
+    全フロアからVR＋可用性OKのアイテムを遅延列挙する。
+    呼び出し側で必要な件数だけ取得すれば、以降のAPI/HTTPリクエストは発生しない。
+    """
     print("[API] フロア横断取得開始 →", ",".join(Config.FLOORS))
+    total_seen = 0
+    total_vr = 0
+    total_available = 0
 
-    raw_items: list[dict] = []
     for floor in Config.FLOORS:
-        raw_items.extend(_fetch_floor_items(floor))
-
-    # VR作品のみに絞り込み
-    vr_items = [item for item in raw_items if contains_vr(item)]
-
-    # 可用性（発売済み相当）フィルタ
-    available: list[dict] = []
-    for item in vr_items:
-        ok = is_available_now(item)
-        print(f"  - [{'OK' if ok else 'NG'}] {item.get('title', '')}")
-        if ok:
-            available.append(item)
+        for page_items in _iter_floor_pages(floor):
+            total_seen += len(page_items)
+            for item in page_items:
+                if not contains_vr(item):
+                    continue
+                total_vr += 1
+                if not is_available_now(item):
+                    print(f"  - [NG] {item.get('title', '')}")
+                    continue
+                total_available += 1
+                print(f"  - [OK] {item.get('title', '')}")
+                yield item
 
     print(
-        f"[API] 総取得: {len(raw_items)} / "
-        f"VR判定: {len(vr_items)} / 可用性OK: {len(available)}"
+        f"[API] 総取得: {total_seen} / "
+        f"VR判定: {total_vr} / 可用性OK: {total_available}"
     )
-    available.sort(key=lambda x: x.get("date", ""), reverse=True)
-    return available
 
 
 # ============================================================
@@ -742,30 +743,24 @@ def create_wp_post(item: dict, wp: Client, category: str, affiliate_id: str) -> 
 # ============================================================
 # メイン
 # ============================================================
-def _split_recent_and_backlog(items: list[dict]) -> tuple[list[dict], list[dict]]:
-    """直近N日のアイテムとそれ以外に分割。"""
-    boundary = now_jst() - timedelta(days=Config.RECENT_DAYS)
-    recent = [i for i in items if parse_jst_date(i.get("date", "")) >= boundary]
-    backlog = [i for i in items if i not in recent]
-    return recent, backlog
-
-
 def main() -> None:
-    print(f"[{now_jst()}] VR新着投稿開始（VR超厳密＋可用性チェック）")
+    print(f"[{now_jst()}] VR新着投稿開始（VR超厳密＋可用性チェック / 早期終了モード）")
+    print(
+        f"[設定] POST_LIMIT={Config.POST_LIMIT}, "
+        f"HITS={Config.HITS}, MAX_PAGES={Config.MAX_PAGES}, "
+        f"FLOORS={Config.FLOORS}, SCRAPE_DESC={Config.SCRAPE_DESC}"
+    )
 
     wp = Client(get_env("WP_URL"), get_env("WP_USER"), get_env("WP_PASS"))
     category = get_env("CATEGORY")
     affiliate_id = get_env("DMM_AFFILIATE_ID")
 
-    items = fetch_vr_items_from_floors()
-    recent, backlog = _split_recent_and_backlog(items)
-    print(f"直近{Config.RECENT_DAYS}日: {len(recent)} / バックログ: {len(backlog)}")
-
     posted = 0
-    for item in recent + backlog:
+    for item in iter_vr_available_items():
         if create_wp_post(item, wp, category, affiliate_id):
             posted += 1
             if posted >= Config.POST_LIMIT:
+                print(f"[早期終了] POST_LIMIT={Config.POST_LIMIT} 件に到達")
                 break
 
     print(f"投稿数: {posted}")
