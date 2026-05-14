@@ -460,18 +460,25 @@ def iter_vr_available_items() -> Iterator[dict]:
                     continue
                 total_vr += 1
 
-                # 発売前は除外（発売済を優先）
+                # 可用性チェック（=実際の発売判定）を最優先
+                # 画像と詳細ページの実体があれば配信済みとみなす。
+                # API の date は予約商品でも未来日付になることがあるため信用しない。
+                if is_available_now(item):
+                    total_available += 1
+                    date_note = ""
+                    if Config.EXCLUDE_PRE_RELEASE and is_pre_release(item):
+                        # 配信実体はあるが date が未来 → 実配信済みと判断して採用
+                        date_note = f"（date={item.get('date','')} は将来日付だが実体あり）"
+                    print(f"  - [OK] {item.get('title', '')}{date_note}")
+                    yield item
+                    continue
+
+                # 可用性NG。発売前か単なる取得失敗かをログで区別
                 if Config.EXCLUDE_PRE_RELEASE and is_pre_release(item):
                     total_prerelease += 1
                     print(f"  - [発売前スキップ] {item.get('date','')} {item.get('title', '')}")
-                    continue
-
-                if not is_available_now(item):
+                else:
                     print(f"  - [NG] {item.get('title', '')}")
-                    continue
-                total_available += 1
-                print(f"  - [OK] {item.get('title', '')}")
-                yield item
 
     print(
         f"[API] 総取得: {total_seen} / VR判定: {total_vr} / "
