@@ -99,8 +99,8 @@ class Config:
     SCRAPE_DESC = os.getenv("SCRAPE_DESC", "0") == "1"
     # 詳細ページ取得時の優先ドメイン（"www" / "video" / "" のいずれか）
     FORCE_DETAIL_DOMAIN = os.getenv("FORCE_DETAIL_DOMAIN", "").strip().lower()
-    # 発売前（dateが未来）のアイテムを除外するか
-    EXCLUDE_PRE_RELEASE = os.getenv("EXCLUDE_PRE_RELEASE", "1") == "1"
+    # 発売前（dateが未来）のアイテムを除外するか（デフォルト無効：予約商品も投稿）
+    EXCLUDE_PRE_RELEASE = os.getenv("EXCLUDE_PRE_RELEASE", "0") == "1"
 
 
 # 説明文として採用する文字数の範囲
@@ -400,11 +400,6 @@ def base_params(offset: int, floor: str, use_keyword: bool = True) -> dict:
     }
     if use_keyword:
         params["keyword"] = "VR"
-    # 発売前除外モード時、API側で発売日 <= 現在 のものに絞り込む
-    # これにより keyword=VR + sort=date でも予約品が上位を埋めなくなり、
-    # 発売済み新作VRが効率的に取得できる
-    if Config.EXCLUDE_PRE_RELEASE:
-        params["lte_date"] = now_jst().strftime("%Y-%m-%dT%H:%M:%S")
     return params
 
 
@@ -789,18 +784,14 @@ def create_wp_post(item: dict, wp: Client, category: str, affiliate_id: str) -> 
 # メイン
 # ============================================================
 def main() -> None:
-    print(f"[{now_jst()}] VR新着投稿開始（VR超厳密＋可用性＋発売済チェック / 早期終了モード）")
-    lte_label = (
-        f"lte_date={now_jst().strftime('%Y-%m-%dT%H:%M:%S')}"
-        if Config.EXCLUDE_PRE_RELEASE else "lte_date=なし"
-    )
+    print(f"[{now_jst()}] VR新着投稿開始（VR超厳密＋可用性チェック / 早期終了モード）")
     print(
         f"[設定] POST_LIMIT={Config.POST_LIMIT}, "
         f"HITS={Config.HITS}, MAX_PAGES={Config.MAX_PAGES}, "
         f"MAX_PAGES_FALLBACK={Config.MAX_PAGES_FALLBACK}, "
         f"FLOORS={Config.FLOORS}, "
         f"SCRAPE_DESC={Config.SCRAPE_DESC}, "
-        f"EXCLUDE_PRE_RELEASE={Config.EXCLUDE_PRE_RELEASE} ({lte_label})"
+        f"EXCLUDE_PRE_RELEASE={Config.EXCLUDE_PRE_RELEASE}"
     )
 
     wp = Client(get_env("WP_URL"), get_env("WP_USER"), get_env("WP_PASS"))
