@@ -88,14 +88,19 @@ class Config:
 
     POST_LIMIT = int(os.getenv("POST_LIMIT", "2"))
     RECENT_DAYS = int(os.getenv("RECENT_DAYS", "3"))
-    HITS = int(os.getenv("HITS", "20"))
-    MAX_PAGES = int(os.getenv("MAX_PAGES", "3"))
+    HITS = int(os.getenv("HITS", "10"))
+    # 通常時に取得するページ数（POST_LIMITに達したら早期終了）
+    MAX_PAGES = int(os.getenv("MAX_PAGES", "2"))
+    # 通常範囲で見つからなかった場合の上限（フォールバック拡張）
+    MAX_PAGES_FALLBACK = int(os.getenv("MAX_PAGES_FALLBACK", "6"))
     FLOORS = [f.strip() for f in os.getenv("FLOORS", "videoa,videoc").split(",") if f.strip()]
     AGE_GATE_COOKIE = os.getenv("AGE_GATE_COOKIE", "").strip()
     # 詳細ページから説明文をスクレイピングするか（"1" で有効）
     SCRAPE_DESC = os.getenv("SCRAPE_DESC", "0") == "1"
     # 詳細ページ取得時の優先ドメイン（"www" / "video" / "" のいずれか）
     FORCE_DETAIL_DOMAIN = os.getenv("FORCE_DETAIL_DOMAIN", "").strip().lower()
+    # 発売前（dateが未来）のアイテムを除外するか
+    EXCLUDE_PRE_RELEASE = os.getenv("EXCLUDE_PRE_RELEASE", "1") == "1"
 
 
 # 説明文として採用する文字数の範囲
@@ -398,9 +403,15 @@ def base_params(offset: int, floor: str, use_keyword: bool = True) -> dict:
     return params
 
 
-def _iter_floor_pages(floor: str) -> Iterator[list[dict]]:
-    """指定フロアのページを1ページずつ遅延取得する。"""
-    for page in range(Config.MAX_PAGES):
+def is_pre_release(item: dict) -> bool:
+    """API の date が未来の場合は発売前と判定。"""
+    release_date = parse_jst_date(item.get("date", ""))
+    return release_date > now_jst()
+
+
+def _iter_floor_pages(floor: str, max_pages: int) -> Iterator[tuple[int, list[dict]]]:
+    """指定フロアのページを1ページずつ遅延取得（ページ番号付き）。"""
+    for page in range(max_pages):
         offset = 1 + page * Config.HITS
         print(f"[API] floor={floor} page={page + 1} offset={offset}")
         result = dmm_request(base_params(offset, floor, use_keyword=True))
@@ -408,27 +419,53 @@ def _iter_floor_pages(floor: str) -> Iterator[list[dict]]:
         print(f"[API] 取得 {len(page_items)} 件")
         if not page_items:
             return
-        yield page_items
+        yield page + 1, page_items
         time.sleep(API_SLEEP_SECONDS)
 
 
 def iter_vr_available_items() -> Iterator[dict]:
     """
-    全フロアからVR＋可用性OKのアイテムを遅延列挙する。
-    呼び出し側で必要な件数だけ取得すれば、以降のAPI/HTTPリクエストは発生しない。
+    全フロアからVR＋発売済＋可用性OKのアイテムを遅延列挙する。
+
+    通常は MAX_PAGES まで取得して終了するが、呼び出し側が値を消費し続けた場合、
+    自動的に MAX_PAGES_FALLBACK までフォールバック拡張する。
+    呼び出し側が break すれば、それ以降のAPI/HTTPリクエストは発生しない。
     """
     print("[API] フロア横断取得開始 →", ",".join(Config.FLOORS))
+    print(
+        f"[API] MAX_PAGES={Config.MAX_PAGES} "
+        f"（フォールバック拡張: 最大 {Config.MAX_PAGES_FALLBACK} ページまで）"
+    )
+
     total_seen = 0
     total_vr = 0
+    total_prerelease = 0
     total_available = 0
+    upper_limit = max(Config.MAX_PAGES, Config.MAX_PAGES_FALLBACK)
 
     for floor in Config.FLOORS:
-        for page_items in _iter_floor_pages(floor):
+        fallback_announced = False
+        for page_no, page_items in _iter_floor_pages(floor, upper_limit):
+            # 通常範囲を超えたタイミングで一度だけログ出力
+            if page_no > Config.MAX_PAGES and not fallback_announced:
+                print(
+                    f"[フォールバック] floor={floor} page={page_no} "
+                    f"通常範囲({Config.MAX_PAGES}ページ)を超えたため拡張検索中"
+                )
+                fallback_announced = True
+
             total_seen += len(page_items)
             for item in page_items:
                 if not contains_vr(item):
                     continue
                 total_vr += 1
+
+                # 発売前は除外（発売済を優先）
+                if Config.EXCLUDE_PRE_RELEASE and is_pre_release(item):
+                    total_prerelease += 1
+                    print(f"  - [発売前スキップ] {item.get('date','')} {item.get('title', '')}")
+                    continue
+
                 if not is_available_now(item):
                     print(f"  - [NG] {item.get('title', '')}")
                     continue
@@ -437,8 +474,8 @@ def iter_vr_available_items() -> Iterator[dict]:
                 yield item
 
     print(
-        f"[API] 総取得: {total_seen} / "
-        f"VR判定: {total_vr} / 可用性OK: {total_available}"
+        f"[API] 総取得: {total_seen} / VR判定: {total_vr} / "
+        f"発売前除外: {total_prerelease} / 可用性OK: {total_available}"
     )
 
 
@@ -744,11 +781,14 @@ def create_wp_post(item: dict, wp: Client, category: str, affiliate_id: str) -> 
 # メイン
 # ============================================================
 def main() -> None:
-    print(f"[{now_jst()}] VR新着投稿開始（VR超厳密＋可用性チェック / 早期終了モード）")
+    print(f"[{now_jst()}] VR新着投稿開始（VR超厳密＋可用性＋発売済チェック / 早期終了モード）")
     print(
         f"[設定] POST_LIMIT={Config.POST_LIMIT}, "
         f"HITS={Config.HITS}, MAX_PAGES={Config.MAX_PAGES}, "
-        f"FLOORS={Config.FLOORS}, SCRAPE_DESC={Config.SCRAPE_DESC}"
+        f"MAX_PAGES_FALLBACK={Config.MAX_PAGES_FALLBACK}, "
+        f"FLOORS={Config.FLOORS}, "
+        f"SCRAPE_DESC={Config.SCRAPE_DESC}, "
+        f"EXCLUDE_PRE_RELEASE={Config.EXCLUDE_PRE_RELEASE}"
     )
 
     wp = Client(get_env("WP_URL"), get_env("WP_USER"), get_env("WP_PASS"))
