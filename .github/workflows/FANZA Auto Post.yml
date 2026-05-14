@@ -32,6 +32,8 @@ jobs:
           RECENT_DAYS: "3"    # 直近3日を“新作”扱い
           SCRAPE_DESC: "1"  # ← 安全運用なら0のまま推奨
           AGE_GATE_COOKIE: ${{ secrets.AGE_GATE_COOKIE }}  # ← 先生の“自分の”クッキー
-          HITS: "30"
-          MAX_PAGES: "6"
+          HITS: "10"
+          MAX_PAGES: "2"           # 通常時の取得ページ数
+          MAX_PAGES_FALLBACK: "6"  # 見つからない時はここまで自動拡張
+          EXCLUDE_PRE_RELEASE: "1" # 1=発売前を除外（推奨）
         run: python fanza_vr_auto_post.py
