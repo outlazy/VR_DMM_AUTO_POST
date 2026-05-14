@@ -35,5 +35,5 @@ jobs:
           HITS: "10"
           MAX_PAGES: "2"           # 通常時の取得ページ数
           MAX_PAGES_FALLBACK: "6"  # 見つからない時はここまで自動拡張
-          EXCLUDE_PRE_RELEASE: "1" # 1=発売前を除外（推奨）
+          EXCLUDE_PRE_RELEASE: "0" # 0=予約商品も含めて投稿（1で発売前を除外）
         run: python fanza_vr_auto_post.py
