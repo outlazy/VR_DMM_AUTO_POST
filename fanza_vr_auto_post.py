@@ -102,12 +102,12 @@ class Config:
     # 発売前（dateが未来）のアイテムを除外するか（デフォルト無効：予約商品も投稿）
     EXCLUDE_PRE_RELEASE = os.getenv("EXCLUDE_PRE_RELEASE", "0") == "1"
     # WordPressのタグとして登録する iteminfo フィールド（カンマ区切り）
-    # 例: "genre" / "genre,actress" / "genre,actress,maker,series,label"
+    # デフォルト: ジャンル＋出演者＋メーカー名
     TAG_FIELDS = [
-        f.strip() for f in os.getenv("TAG_FIELDS", "genre").split(",") if f.strip()
+        f.strip() for f in os.getenv("TAG_FIELDS", "genre,actress,maker").split(",") if f.strip()
     ]
     # タグ数の上限（多すぎるとSEO的に逆効果）
-    MAX_TAGS = int(os.getenv("MAX_TAGS", "20"))
+    MAX_TAGS = int(os.getenv("MAX_TAGS", "30"))
 
 
 # 説明文として採用する文字数の範囲
