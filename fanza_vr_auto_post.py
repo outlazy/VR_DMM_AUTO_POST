@@ -115,8 +115,8 @@ class Config:
 
 
 # 説明文として採用する文字数の範囲
-DESC_MIN_LEN = 20
-DESC_MAX_LEN = 1200
+DESC_MIN_LEN = 15
+DESC_MAX_LEN = 2000
 
 # スクレイピング時の説明文セレクタ候補（本文用 ＝ 最優先）
 # video.dmm.co.jp（新UI）と www.dmm.co.jp（旧UI）の両方に対応
@@ -164,10 +164,13 @@ JSONLD_DESC_KEYS = ("description", "abstract", "headline")
 
 # JSON（__NEXT_DATA__ 等）内で説明文として扱うキー名
 JSON_DESC_KEYS = (
-    "description", "longDescription", "shortDescription",
-    "comment", "caption", "summary", "synopsis",
+    "description", "longdescription", "shortdescription",
+    "comment", "longcomment", "shortcomment", "monthly_comment",
+    "caption", "summary", "synopsis",
     "story", "abstract", "body", "text", "content",
     "introduction", "outline", "overview",
+    "detail", "details", "info", "explanation",
+    "headcopy", "head_copy", "sub_text", "subtext",
 )
 
 # 「メタ情報っぽい」と判定するためのパターン（スコアペナルティ用）
@@ -307,20 +310,22 @@ def _headers_for_html() -> dict[str, str]:
 
 
 def _candidate_detail_urls(item: dict) -> list[str]:
-    """個別詳細ページの候補URLを重複排除して返す。"""
+    """個別詳細ページの候補URLを重複排除して返す。本文取得しやすい順に並べる。"""
     cid = (item.get("content_id") or item.get("product_id") or "").strip().lower()
     item_url = item.get("URL", "")
 
     candidates: list[str] = []
+    if item_url:
+        candidates.append(item_url)
     if cid:
         candidates.extend([
+            # video.dmm.co.jp（新UI / Next.js）。__NEXT_DATA__ に本文がある
             f"https://video.dmm.co.jp/av/content/?id={cid}",
+            # www.dmm.co.jp（旧UI / 静的HTML）
             f"https://www.dmm.co.jp/digital/vrvideo/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/vrvideo/-/detail/=/cid={cid}/",
             f"https://www.dmm.co.jp/digital/videoa/-/detail/=/cid={cid}/",
         ])
-    if item_url:
-        candidates.append(item_url)
 
     seen: set[str] = set()
     unique: list[str] = []
@@ -702,6 +707,29 @@ def _collect_longest_paragraphs(soup: BeautifulSoup) -> list[tuple[int, str, str
     return results
 
 
+def _collect_candidates_from_raw_regex(html_text: str) -> list[tuple[int, str, str]]:
+    """
+    最終フォールバック: HTMLの生テキストを正規表現で走査し、
+    日本語の長文ブロックを抽出する。タグ構造に依存しないため、
+    JS生成のテキストや改行で分断されたテキストも拾える。
+    """
+    results: list[tuple[int, str, str]] = []
+    # JSON文字列値（"..."内）から日本語が多く含まれる長い文字列を抽出
+    pattern = re.compile(r'"([^"\\]{30,2000}(?:\\.[^"\\]{0,2000})*)"')
+    for match in pattern.finditer(html_text):
+        raw = match.group(1)
+        # JSONエスケープを解除（\n, \", \\ など）
+        try:
+            decoded = json.loads(f'"{raw}"')
+        except Exception:
+            decoded = raw.replace("\\n", "\n").replace("\\\"", '"').replace("\\\\", "\\")
+        text = _clean_text(decoded)
+        score = _score_description(text)
+        if score > 0:
+            results.append((score, text, "regex:json-str"))
+    return results
+
+
 def _extract_description_from_html(html_text: str) -> Optional[str]:
     """
     HTMLから説明文を抽出する（スコアリング方式）。
@@ -723,8 +751,17 @@ def _extract_description_from_html(html_text: str) -> Optional[str]:
     meta_candidates = _collect_candidates_from_selectors(soup, DESC_SELECTORS_META, "meta")
     meta_candidates = [(min(s, 300), t, l) for s, t, l in meta_candidates]
     candidates.extend(meta_candidates)
-    # 最長のp/div（最終フォールバック）
+    # 最長のp/div（フォールバック）
     candidates.extend(_collect_longest_paragraphs(soup))
+    # 生HTML正規表現スキャン（最終フォールバック：JSON文字列値の抽出）
+    candidates.extend(_collect_candidates_from_raw_regex(html_text))
+
+    # デバッグ：上位5件の候補をログ出力
+    if Config.SCRAPE_DEBUG in ("1", "2") and candidates:
+        ranked = sorted(candidates, key=lambda x: -x[0])[:5]
+        print(f"  [scrape] 候補数={len(candidates)}, 上位5件:")
+        for s, t, l in ranked:
+            print(f"    score={s} src={l} len={len(t)}")
 
     if not candidates:
         return None
