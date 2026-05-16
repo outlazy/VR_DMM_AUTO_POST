@@ -101,15 +101,35 @@ class Config:
     FORCE_DETAIL_DOMAIN = os.getenv("FORCE_DETAIL_DOMAIN", "").strip().lower()
     # 発売前（dateが未来）のアイテムを除外するか（デフォルト無効：予約商品も投稿）
     EXCLUDE_PRE_RELEASE = os.getenv("EXCLUDE_PRE_RELEASE", "0") == "1"
+    # WordPressのタグとして登録する iteminfo フィールド（カンマ区切り）
+    # 例: "genre" / "genre,actress" / "genre,actress,maker,series,label"
+    TAG_FIELDS = [
+        f.strip() for f in os.getenv("TAG_FIELDS", "genre").split(",") if f.strip()
+    ]
+    # タグ数の上限（多すぎるとSEO的に逆効果）
+    MAX_TAGS = int(os.getenv("MAX_TAGS", "20"))
 
 
 # 説明文として採用する文字数の範囲
 DESC_MIN_LEN = 20
 DESC_MAX_LEN = 1200
 
-# スクレイピング時の説明文セレクタ候補
+# スクレイピング時の説明文セレクタ候補（本文用 ＝ 最優先）
 # video.dmm.co.jp（新UI）と www.dmm.co.jp（旧UI）の両方に対応
-DESC_SELECTORS = [
+DESC_SELECTORS_BODY = [
+    # ===== www.dmm.co.jp (旧UI / Adult Video) - 説明文の定番位置 =====
+    "div.mg-b20.lh4 p.mg-b20",
+    "div.mg-b20.lh4 p",
+    "div.mg-b20.lh4",
+    "p.mg-b20.lh4",
+    # ===== 詳細説明・あらすじ系 =====
+    'div[class*="comment"] p',
+    'div[class*="story"] p',
+    'div[class*="synopsis"] p',
+    'div[class*="caption"] p',
+    'div[class*="introduction"] p',
+    'div[class*="text-overflow"]',
+    'p[class*="text-overflow"]',
     # ===== video.dmm.co.jp (新UI / React) =====
     '[data-e2e="description"]',
     '[data-e2e="summary"]',
@@ -117,18 +137,19 @@ DESC_SELECTORS = [
     '[data-testid="summary"]',
     'div[class*="summary__txt"]',
     'div[class*="Summary__text"]',
-    'div[class*="description"] p',
-    'p[class*="description"]',
     'section[class*="summary"] p',
     'section[class*="description"] p',
+    'div[class*="ProductDescription"] p',
+    'div[class*="productDescription"] p',
     'div[class*="ProductDetail"] p',
-    'p[class*="text-overflow"]',
+    # ===== descriptionで囲われた汎用パターン（user指摘） =====
+    '[class*="description"]:not([class*="title"]):not([class*="header"]):not([class*="label"])',
+    '[id*="description"]',
     '[itemprop="description"]',
-    # ===== www.dmm.co.jp (旧UI) =====
-    "div.mg-b20.lh4 p",
-    "div.mg-b20.lh4",
-    "p.mg-b20",
-    # ===== 共通 =====
+]
+
+# メタタグ系（最終フォールバック）- 本文が取れない時のみ使用
+DESC_SELECTORS_META = [
     'meta[property="og:description"]',
     'meta[name="description"]',
     'meta[name="twitter:description"]',
@@ -136,6 +157,18 @@ DESC_SELECTORS = [
 
 # JSON-LDから説明文を取り出すときに見るキー
 JSONLD_DESC_KEYS = ("description", "abstract", "headline")
+
+# 「メタ情報っぽい」と判定するためのパターン（スコアペナルティ用）
+METADATA_LIKE_PATTERNS = (
+    "ジャンル：", "ジャンル:",
+    "出演：", "出演:",
+    "メーカー：", "メーカー:",
+    "シリーズ：", "シリーズ:",
+    "レーベル：", "レーベル:",
+    "収録時間：", "収録時間:",
+    "監督：", "監督:",
+    "品番：", "品番:",
+)
 
 
 # ============================================================
@@ -523,9 +556,32 @@ def _is_valid_description(text: str) -> bool:
     return bool(re.search(r"[぀-ヿ一-鿿]", text))
 
 
-def _extract_from_selectors(soup: BeautifulSoup) -> Optional[str]:
-    """登録済みセレクタを順番に試して、最初に妥当な説明文を返す。"""
-    for selector in DESC_SELECTORS:
+def _score_description(text: str) -> int:
+    """
+    説明文候補のスコアを計算。
+    長いほど高スコア。メタ情報っぽいラベルが多いとペナルティ。
+    """
+    if not _is_valid_description(text):
+        return -1
+    score = len(text)
+    # メタ情報パターンが含まれているとペナルティ（1件あたり-200）
+    for pattern in METADATA_LIKE_PATTERNS:
+        if pattern in text:
+            score -= 200
+    # 「DMM」「FANZA」「無料サンプル」等のSEO定型句もペナルティ
+    seo_patterns = ("DMM", "FANZA", "無料サンプル", "ダウンロード", "ストリーミング")
+    for pattern in seo_patterns:
+        if pattern in text:
+            score -= 50
+    return score
+
+
+def _collect_candidates_from_selectors(
+    soup: BeautifulSoup, selectors: list[str], label: str
+) -> list[tuple[int, str, str]]:
+    """セレクタ群から候補テキストを収集（スコア、本文、ラベル）のリストを返す。"""
+    results: list[tuple[int, str, str]] = []
+    for selector in selectors:
         try:
             elements = soup.select(selector)
         except Exception:
@@ -535,21 +591,21 @@ def _extract_from_selectors(soup: BeautifulSoup) -> Optional[str]:
                 text = _clean_text(element.get("content", ""))
             else:
                 text = _clean_text(element.get_text(" ", strip=True))
-            if _is_valid_description(text):
-                return text
-    return None
+            score = _score_description(text)
+            if score > 0:
+                results.append((score, text, f"{label}:{selector}"))
+    return results
 
 
-def _extract_from_jsonld(soup: BeautifulSoup) -> Optional[str]:
-    """JSON-LD（<script type="application/ld+json">）から説明文を抽出。"""
+def _collect_candidates_from_jsonld(soup: BeautifulSoup) -> list[tuple[int, str, str]]:
+    """JSON-LDから候補テキストを収集。"""
+    results: list[tuple[int, str, str]] = []
     for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
         raw = script.string or script.get_text() or ""
         try:
             data = json.loads(raw)
         except Exception:
             continue
-
-        # 単体オブジェクトまたは配列に対応
         candidates = data if isinstance(data, list) else [data]
         for entry in candidates:
             if not isinstance(entry, dict):
@@ -558,47 +614,53 @@ def _extract_from_jsonld(soup: BeautifulSoup) -> Optional[str]:
                 value = entry.get(key)
                 if isinstance(value, str):
                     text = _clean_text(value)
-                    if _is_valid_description(text):
-                        return text
-    return None
+                    score = _score_description(text)
+                    if score > 0:
+                        results.append((score, text, f"jsonld:{key}"))
+    return results
 
 
-def _extract_longest_paragraph(soup: BeautifulSoup) -> Optional[str]:
-    """ヒューリスティック: 妥当な長さの中で最も長い p/div テキストを返す。"""
-    best: Optional[str] = None
+def _collect_longest_paragraphs(soup: BeautifulSoup) -> list[tuple[int, str, str]]:
+    """フォールバック: 全 p/div からスコア付き候補を収集。"""
+    results: list[tuple[int, str, str]] = []
     for tag in soup.find_all(["p", "div"]):
         text = _clean_text(tag.get_text(" ", strip=True))
-        if not _is_valid_description(text):
-            continue
-        if best is None or len(text) > len(best):
-            best = text
-    return best
+        score = _score_description(text)
+        if score > 0:
+            results.append((score, text, f"longest:{tag.name}"))
+    return results
 
 
 def _extract_description_from_html(html_text: str) -> Optional[str]:
-    """HTMLから説明文と思しきテキストを抽出する（複数戦略で試行）。"""
+    """
+    HTMLから説明文を抽出する（スコアリング方式）。
+    全戦略の候補を集めて、最もスコアが高いものを採用。
+    """
     try:
         soup = BeautifulSoup(html_text, "lxml")
     except Exception:
-        # lxmlが使えない環境では html.parser にフォールバック
         soup = BeautifulSoup(html_text, "html.parser")
 
-    # 戦略1: 既知のセレクタ
-    text = _extract_from_selectors(soup)
-    if text:
-        return text
+    candidates: list[tuple[int, str, str]] = []
+    # 本文系セレクタ（最優先）
+    candidates.extend(_collect_candidates_from_selectors(soup, DESC_SELECTORS_BODY, "body"))
+    # JSON-LD
+    candidates.extend(_collect_candidates_from_jsonld(soup))
+    # メタタグ（最終手段）- 低めの最大スコアにするため上限を300に圧縮
+    meta_candidates = _collect_candidates_from_selectors(soup, DESC_SELECTORS_META, "meta")
+    meta_candidates = [(min(s, 300), t, l) for s, t, l in meta_candidates]
+    candidates.extend(meta_candidates)
+    # 最長のp/div（最終フォールバック）
+    candidates.extend(_collect_longest_paragraphs(soup))
 
-    # 戦略2: JSON-LD
-    text = _extract_from_jsonld(soup)
-    if text:
-        return text
+    if not candidates:
+        return None
 
-    # 戦略3: 最長のp/divテキスト
-    text = _extract_longest_paragraph(soup)
-    if text:
-        return text
-
-    return None
+    # スコア降順で並べて最良を採用
+    candidates.sort(key=lambda x: -x[0])
+    best_score, best_text, best_label = candidates[0]
+    print(f"  [scrape] 採用: {best_label} (score={best_score}, len={len(best_text)})")
+    return best_text
 
 
 def scrape_description(item: dict) -> Optional[str]:
@@ -646,19 +708,28 @@ def _compose_metadata_description(item: dict) -> str:
 
 def fallback_description(item: dict) -> str:
     """
-    投稿本文用の説明テキストを生成。優先順位:
-      1. APIレスポンス内の既存説明文
-      2. 詳細ページからスクレイピングした説明文（SCRAPE_DESC=1のとき）
-      3. メタ情報から自動生成
+    投稿本文用の説明テキストを生成。
+
+    優先順位:
+      - SCRAPE_DESC=1 のとき: スクレイピング → API説明 → メタ情報自動生成
+      - SCRAPE_DESC=0 のとき: API説明 → メタ情報自動生成
+
+    ※スクレイピング有効時は、詳細ページの本文が API のショートな説明より優先される。
     """
+    if Config.SCRAPE_DESC:
+        scraped = scrape_description(item)
+        if scraped:
+            return scraped
+
+        existing = _pick_existing_description(item)
+        if existing:
+            return existing
+
+        return _compose_metadata_description(item)
+
     existing = _pick_existing_description(item)
     if existing:
         return existing
-
-    scraped = scrape_description(item)
-    if scraped:
-        return scraped
-
     return _compose_metadata_description(item)
 
 
@@ -704,6 +775,33 @@ def _is_already_posted(wp: Client, title: str) -> bool:
     except Exception as e:
         print(f"[既投稿チェック失敗] {e}")
         return False
+
+
+def _extract_tags_from_item(item: dict) -> list[str]:
+    """
+    item.iteminfo の指定フィールド（Config.TAG_FIELDS）から
+    タグ用の名前リストを抽出し、重複排除して返す。
+    """
+    iteminfo = item.get("iteminfo") or {}
+    tags: list[str] = []
+    seen: set[str] = set()
+
+    for field in Config.TAG_FIELDS:
+        entries = iteminfo.get(field, [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = (entry.get("name") or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                tags.append(name)
+
+    # 上限カット
+    if Config.MAX_TAGS > 0 and len(tags) > Config.MAX_TAGS:
+        tags = tags[: Config.MAX_TAGS]
+    return tags
 
 
 def _build_post_content(
@@ -766,17 +864,26 @@ def create_wp_post(item: dict, wp: Client, category: str, affiliate_id: str) -> 
     description = fallback_description(item)
     content = _build_post_content(title, affiliate_link, wp_image_urls, description)
 
+    # タグ抽出（ジャンル等）
+    tags = _extract_tags_from_item(item)
+
     # 投稿
     post = WordPressPost()
     post.title = title
     post.content = content
     if thumbnail_id:
         post.thumbnail = thumbnail_id
-    post.terms_names = {"category": [category]}
+    terms_names: dict[str, list[str]] = {"category": [category]}
+    if tags:
+        terms_names["post_tag"] = tags
+    post.terms_names = terms_names
     post.post_status = "publish"
     wp.call(posts.NewPost(post))
 
-    print(f"✔ 投稿完了: {title} （画像 {len(uploaded)}/{len(source_images)} 枚）")
+    print(
+        f"✔ 投稿完了: {title} "
+        f"（画像 {len(uploaded)}/{len(source_images)} 枚, タグ {len(tags)} 件）"
+    )
     return True
 
 
