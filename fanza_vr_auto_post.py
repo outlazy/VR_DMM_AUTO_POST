@@ -41,7 +41,7 @@ for _name in ("Iterable", "Mapping", "MutableMapping", "Sequence"):
 
 from wordpress_xmlrpc import Client, WordPressPost
 from wordpress_xmlrpc.compat import xmlrpc_client
-from wordpress_xmlrpc.methods import media, posts
+from wordpress_xmlrpc.methods import media, posts, taxonomies
 from wordpress_xmlrpc.methods.posts import GetPosts
 
 
@@ -108,6 +108,8 @@ class Config:
     ]
     # タグ数の上限（多すぎるとSEO的に逆効果）
     MAX_TAGS = int(os.getenv("MAX_TAGS", "30"))
+    # タグ名と一致する既存WPカテゴリも自動でチェック（割り当て）するか
+    AUTO_MATCH_CATEGORY = os.getenv("AUTO_MATCH_CATEGORY", "1") == "1"
 
 
 # 説明文として採用する文字数の範囲
@@ -873,6 +875,45 @@ def _extract_tags_from_item(item: dict) -> list[str]:
     return tags
 
 
+# 既存WPカテゴリ名のセッション内キャッシュ
+_wp_category_cache: Optional[set[str]] = None
+
+
+def _get_wp_category_names(wp: Client) -> set[str]:
+    """
+    既存のWordPressカテゴリ名一覧を取得する。
+    1回の実行内で複数投稿があっても、初回取得後はキャッシュを使用する。
+    """
+    global _wp_category_cache
+    if _wp_category_cache is not None:
+        return _wp_category_cache
+    try:
+        terms = wp.call(taxonomies.GetTerms("category"))
+        names = {
+            (getattr(t, "name", "") or "").strip()
+            for t in terms
+            if getattr(t, "name", None)
+        }
+        names.discard("")
+        _wp_category_cache = names
+        print(f"[WP] 既存カテゴリ {len(names)} 件を取得（キャッシュ済み）")
+    except Exception as e:
+        print(f"[WP] カテゴリ一覧取得失敗: {e}")
+        _wp_category_cache = set()
+    return _wp_category_cache
+
+
+def _find_matching_categories(names: list[str], existing: set[str]) -> list[str]:
+    """names のうち、existing（既存カテゴリ名集合）に含まれるものを順序保持で返す。"""
+    seen: set[str] = set()
+    matched: list[str] = []
+    for name in names:
+        if name in existing and name not in seen:
+            seen.add(name)
+            matched.append(name)
+    return matched
+
+
 def _build_post_content(
     title: str,
     affiliate_link: str,
@@ -936,22 +977,36 @@ def create_wp_post(item: dict, wp: Client, category: str, affiliate_id: str) -> 
     # タグ抽出（ジャンル等）
     tags = _extract_tags_from_item(item)
 
+    # カテゴリ組み立て：メインカテゴリ ＋ タグ名と一致する既存カテゴリ
+    categories: list[str] = [category]
+    matched_categories: list[str] = []
+    if Config.AUTO_MATCH_CATEGORY and tags:
+        existing_cats = _get_wp_category_names(wp)
+        matched_categories = _find_matching_categories(tags, existing_cats)
+        for cat in matched_categories:
+            if cat not in categories:
+                categories.append(cat)
+
     # 投稿
     post = WordPressPost()
     post.title = title
     post.content = content
     if thumbnail_id:
         post.thumbnail = thumbnail_id
-    terms_names: dict[str, list[str]] = {"category": [category]}
+    terms_names: dict[str, list[str]] = {"category": categories}
     if tags:
         terms_names["post_tag"] = tags
     post.terms_names = terms_names
     post.post_status = "publish"
     wp.call(posts.NewPost(post))
 
+    matched_label = (
+        f", 一致カテゴリ {len(matched_categories)} 件" if matched_categories else ""
+    )
     print(
         f"✔ 投稿完了: {title} "
-        f"（画像 {len(uploaded)}/{len(source_images)} 枚, タグ {len(tags)} 件）"
+        f"（画像 {len(uploaded)}/{len(source_images)} 枚, "
+        f"タグ {len(tags)} 件{matched_label}）"
     )
     return True
 
