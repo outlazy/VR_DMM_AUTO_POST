@@ -36,6 +36,6 @@ jobs:
           MAX_PAGES: "2"           # 通常時の取得ページ数
           MAX_PAGES_FALLBACK: "6"  # 見つからない時はここまで自動拡張
           EXCLUDE_PRE_RELEASE: "0" # 0=予約商品も含めて投稿（1で発売前を除外）
-          TAG_FIELDS: "genre"      # タグ化するiteminfoフィールド（カンマ区切り。例: "genre,actress,maker"）
-          MAX_TAGS: "20"           # タグ数の上限
+          TAG_FIELDS: "genre,actress,maker"  # タグ化するiteminfoフィールド（ジャンル＋出演者＋メーカー名）
+          MAX_TAGS: "30"                     # タグ数の上限
         run: python fanza_vr_auto_post.py
