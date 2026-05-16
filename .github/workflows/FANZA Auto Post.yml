@@ -38,4 +38,5 @@ jobs:
           EXCLUDE_PRE_RELEASE: "0" # 0=予約商品も含めて投稿（1で発売前を除外）
           TAG_FIELDS: "genre,actress,maker"  # タグ化するiteminfoフィールド（ジャンル＋出演者＋メーカー名）
           MAX_TAGS: "30"                     # タグ数の上限
+          AUTO_MATCH_CATEGORY: "1"           # 1=タグ名と一致する既存WPカテゴリも自動チェック
         run: python fanza_vr_auto_post.py
