@@ -112,6 +112,19 @@ class Config:
     AUTO_MATCH_CATEGORY = os.getenv("AUTO_MATCH_CATEGORY", "1") == "1"
     # スクレイピングのデバッグ出力（"1"で詳細ログ、"2"でHTMLをファイル保存）
     SCRAPE_DEBUG = os.getenv("SCRAPE_DEBUG", "1")
+    # ===== SEO設定 =====
+    # post_excerpt（抜粋）を自動生成するか
+    SEO_EXCERPT = os.getenv("SEO_EXCERPT", "1") == "1"
+    # 抜粋の最大文字数
+    SEO_EXCERPT_LEN = int(os.getenv("SEO_EXCERPT_LEN", "140"))
+    # CIDベースのSEOフレンドリーなスラッグを設定するか
+    SEO_SLUG = os.getenv("SEO_SLUG", "1") == "1"
+    # スラッグの接頭辞（例: "vr-"）
+    SEO_SLUG_PREFIX = os.getenv("SEO_SLUG_PREFIX", "vr-")
+    # Schema.org Product 構造化データ（JSON-LD）を本文に埋め込むか
+    SEO_SCHEMA = os.getenv("SEO_SCHEMA", "1") == "1"
+    # Yoast SEO のカスタムフィールド（_yoast_wpseo_metadesc 等）も設定するか
+    SEO_YOAST = os.getenv("SEO_YOAST", "0") == "1"
 
 
 # 説明文として採用する文字数の範囲
@@ -997,54 +1010,194 @@ def _find_matching_categories(names: list[str], existing: set[str]) -> list[str]
     return matched
 
 
+# ============================================================
+# SEO関連ユーティリティ
+# ============================================================
+def build_seo_excerpt(intro_text: Optional[str], metadata_text: str) -> str:
+    """
+    検索結果やアーカイブで表示される post_excerpt（抜粋）を生成。
+    紹介文があればそれを優先、なければメタ情報の冒頭を使用。
+    """
+    source = intro_text or metadata_text or ""
+    text = re.sub(r"\s+", " ", source).strip()
+    limit = max(40, Config.SEO_EXCERPT_LEN)
+    if len(text) <= limit:
+        return text
+    # 句点・読点で自然に切る
+    truncated = text[:limit]
+    for delimiter in ("。", "！", "？", "、"):
+        idx = truncated.rfind(delimiter)
+        if idx >= limit * 0.6:
+            return truncated[: idx + 1]
+    return truncated + "…"
+
+
+def build_seo_slug(item: dict) -> str:
+    """CIDベースのSEOフレンドリーなURLスラッグを生成。"""
+    cid = (item.get("content_id") or item.get("product_id") or "").strip().lower()
+    if not cid:
+        return ""
+    # CIDは英数字のみなのでそのまま使える
+    safe_cid = re.sub(r"[^a-z0-9-]", "-", cid)
+    return f"{Config.SEO_SLUG_PREFIX}{safe_cid}"
+
+
+def _get_price_value(item: dict) -> Optional[str]:
+    """item.prices.price から数値文字列を取り出す（"1980円" → "1980"）。"""
+    prices = item.get("prices") or {}
+    raw = (prices.get("price") or "").strip()
+    if not raw:
+        return None
+    match = re.search(r"\d+", raw.replace(",", ""))
+    return match.group(0) if match else None
+
+
+def build_schema_jsonld(
+    item: dict, affiliate_link: str, image_urls: list[str],
+    intro_text: Optional[str], metadata_text: str,
+) -> Optional[str]:
+    """Schema.org Product 構造化データ（JSON-LD）を <script> タグとして生成。"""
+    if not Config.SEO_SCHEMA:
+        return None
+
+    title = (item.get("title") or "").strip()
+    iteminfo = item.get("iteminfo") or {}
+
+    # ブランド: メーカー名を優先、なければレーベル
+    brand_name = ""
+    for field in ("maker", "label"):
+        entries = iteminfo.get(field) or []
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("name"):
+                brand_name = entry["name"]
+                break
+        if brand_name:
+            break
+
+    description = intro_text or metadata_text
+    description = re.sub(r"\s+", " ", description or "").strip()[:1000]
+
+    schema: dict[str, Any] = {
+        "@context": "https://schema.org",
+        "@type": "Product",
+        "name": title,
+        "description": description,
+    }
+    if image_urls:
+        schema["image"] = image_urls[:5]
+    if brand_name:
+        schema["brand"] = {"@type": "Brand", "name": brand_name}
+
+    # 出演者を additionalProperty として
+    actress_names = [
+        a.get("name", "") for a in iteminfo.get("actress", [])
+        if isinstance(a, dict) and a.get("name")
+    ]
+    if actress_names:
+        schema["additionalProperty"] = [
+            {"@type": "PropertyValue", "name": "出演", "value": "、".join(actress_names)}
+        ]
+
+    # 価格情報があれば Offer を追加
+    price = _get_price_value(item)
+    offer: dict[str, Any] = {
+        "@type": "Offer",
+        "url": affiliate_link,
+        "availability": "https://schema.org/InStock",
+    }
+    if price:
+        offer["priceCurrency"] = "JPY"
+        offer["price"] = price
+    schema["offers"] = offer
+
+    # 発売日
+    if item.get("date"):
+        schema["releaseDate"] = item["date"][:10]  # YYYY-MM-DD部分
+
+    return (
+        '<script type="application/ld+json">\n'
+        + json.dumps(schema, ensure_ascii=False, indent=2)
+        + "\n</script>"
+    )
+
+
+def build_yoast_custom_fields(
+    excerpt: str, tags: list[str]
+) -> list[dict]:
+    """Yoast SEO 用のカスタムフィールド（meta description, focus keyword）を生成。"""
+    fields: list[dict] = []
+    if excerpt:
+        fields.append({"key": "_yoast_wpseo_metadesc", "value": excerpt})
+    if tags:
+        # フォーカスキーワードは最初のタグ（ジャンル）を使用
+        fields.append({"key": "_yoast_wpseo_focuskw", "value": tags[0]})
+    return fields
+
+
+def _img_tag(src: str, alt: str, title_attr: str, lazy: bool = True) -> str:
+    """SEO/アクセシビリティを考慮した <img> タグを生成。"""
+    loading = ' loading="lazy" decoding="async"' if lazy else ""
+    return (
+        f'<img src="{src}" alt="{alt}" title="{title_attr}"{loading}>'
+    )
+
+
 def _build_post_content(
     title: str,
     affiliate_link: str,
     images: list[str],
     intro_text: Optional[str],
     metadata_text: str,
+    schema_jsonld: Optional[str] = None,
 ) -> str:
     """
     投稿本文HTMLを組み立てる。
 
     構成:
-      1. メインビジュアル（アフィリエイトリンク付き）
+      1. メインビジュアル（アフィリエイトリンク付き、メイン画像は先読み）
       2. タイトルリンク
       3. 紹介文セクション（あれば）：あらすじ・コメント本文
       4. メタ情報セクション：ジャンル・出演・メーカー等
-      5. ギャラリー画像（2枚目以降）
+      5. ギャラリー画像（2枚目以降、lazy-load）
       6. タイトルリンク（再掲）
+      7. Schema.org Product JSON-LD（SEO_SCHEMA=1のとき）
     """
     affiliate_tag_attrs = 'target="_blank" rel="nofollow noopener"'
 
+    # メイン画像はファーストビュー用に lazy=False（後続はlazy）
+    main_img = _img_tag(images[0], title, title, lazy=False)
     parts: list[str] = [
-        f'<p><a href="{affiliate_link}" {affiliate_tag_attrs}>'
-        f'<img src="{images[0]}" alt="{title}"></a></p>',
+        f'<p><a href="{affiliate_link}" {affiliate_tag_attrs}>{main_img}</a></p>',
         f'<p><a href="{affiliate_link}" {affiliate_tag_attrs}>{title}</a></p>',
     ]
 
     # 紹介文（あらすじ・コメント）セクション
     if intro_text:
         parts.append(
-            f'<div class="vr-intro"><h3>作品紹介</h3>'
+            f'<div class="vr-intro"><h2>作品紹介</h2>'
             f'<p>{intro_text}</p></div>'
         )
 
     # メタ情報（ジャンル・出演者・メーカー等）セクション
     parts.append(
-        f'<div class="vr-meta"><h3>作品情報</h3>'
+        f'<div class="vr-meta"><h2>作品情報</h2>'
         f'<p>{metadata_text}</p></div>'
     )
 
-    # ギャラリー画像
-    parts.extend(
-        f'<p><img src="{img}" alt="{title}"></p>' for img in images[1:]
-    )
+    # ギャラリー画像（alt に位置情報を付与し画像SEO対応）
+    for idx, img in enumerate(images[1:], start=2):
+        alt = f"{title} サンプル画像{idx}"
+        parts.append(f'<p>{_img_tag(img, alt, alt, lazy=True)}</p>')
 
     # 末尾にタイトルリンク再掲
     parts.append(
         f'<p><a href="{affiliate_link}" {affiliate_tag_attrs}>{title}</a></p>'
     )
+
+    # Schema.org JSON-LD（リッチスニペット用）
+    if schema_jsonld:
+        parts.append(schema_jsonld)
+
     return "\n".join(parts)
 
 
@@ -1079,12 +1232,16 @@ def create_wp_post(item: dict, wp: Client, category: str, affiliate_id: str) -> 
     thumbnail_id = uploaded[0]["id"]
     wp_image_urls = [u["url"] for u in uploaded if u.get("url")]
 
-    # 本文組み立て（紹介文セクション ＋ メタ情報セクションを分けて生成）
+    # 本文組み立て（紹介文セクション ＋ メタ情報セクション ＋ SEO構造化データ）
     affiliate_link = make_affiliate_link(item["URL"], affiliate_id)
     intro_text = build_intro_text(item)
     metadata_text = build_metadata_text(item)
+    schema_jsonld = build_schema_jsonld(
+        item, affiliate_link, wp_image_urls, intro_text, metadata_text
+    )
     content = _build_post_content(
-        title, affiliate_link, wp_image_urls, intro_text, metadata_text
+        title, affiliate_link, wp_image_urls,
+        intro_text, metadata_text, schema_jsonld,
     )
 
     # タグ抽出（ジャンル等）
@@ -1100,12 +1257,23 @@ def create_wp_post(item: dict, wp: Client, category: str, affiliate_id: str) -> 
             if cat not in categories:
                 categories.append(cat)
 
+    # SEO: 抜粋・スラッグ・カスタムフィールド
+    excerpt = build_seo_excerpt(intro_text, metadata_text) if Config.SEO_EXCERPT else ""
+    slug = build_seo_slug(item) if Config.SEO_SLUG else ""
+    custom_fields = build_yoast_custom_fields(excerpt, tags) if Config.SEO_YOAST else []
+
     # 投稿
     post = WordPressPost()
     post.title = title
     post.content = content
+    if excerpt:
+        post.excerpt = excerpt
+    if slug:
+        post.slug = slug
     if thumbnail_id:
         post.thumbnail = thumbnail_id
+    if custom_fields:
+        post.custom_fields = custom_fields
     terms_names: dict[str, list[str]] = {"category": categories}
     if tags:
         terms_names["post_tag"] = tags
@@ -1116,10 +1284,21 @@ def create_wp_post(item: dict, wp: Client, category: str, affiliate_id: str) -> 
     matched_label = (
         f", 一致カテゴリ {len(matched_categories)} 件" if matched_categories else ""
     )
+    seo_bits: list[str] = []
+    if excerpt:
+        seo_bits.append(f"抜粋{len(excerpt)}字")
+    if slug:
+        seo_bits.append(f"slug={slug}")
+    if schema_jsonld:
+        seo_bits.append("Schema埋込")
+    if custom_fields:
+        seo_bits.append(f"Yoast{len(custom_fields)}件")
+    seo_label = f", SEO[{', '.join(seo_bits)}]" if seo_bits else ""
+
     print(
         f"✔ 投稿完了: {title} "
         f"（画像 {len(uploaded)}/{len(source_images)} 枚, "
-        f"タグ {len(tags)} 件{matched_label}）"
+        f"タグ {len(tags)} 件{matched_label}{seo_label}）"
     )
     return True
 
