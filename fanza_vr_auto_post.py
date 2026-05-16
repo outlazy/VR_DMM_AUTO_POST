@@ -777,31 +777,36 @@ def _compose_metadata_description(item: dict) -> str:
     return description if len(description) > 10 else "FANZA（DMM）VR作品の自動紹介です。"
 
 
-def fallback_description(item: dict) -> str:
+def build_intro_text(item: dict) -> Optional[str]:
     """
-    投稿本文用の説明テキストを生成。
+    紹介文（あらすじ・コメント本文）を取得する。
+    優先順位: スクレイピング（SCRAPE_DESC=1のとき） → API説明 → None
 
-    優先順位:
-      - SCRAPE_DESC=1 のとき: スクレイピング → API説明 → メタ情報自動生成
-      - SCRAPE_DESC=0 のとき: API説明 → メタ情報自動生成
-
-    ※スクレイピング有効時は、詳細ページの本文が API のショートな説明より優先される。
+    メタ情報（ジャンル一覧等）は含めず、純粋なストーリー/紹介本文のみを返す。
+    取得できなければ None を返す（→ 投稿時はメタ情報セクションのみになる）。
     """
     if Config.SCRAPE_DESC:
         scraped = scrape_description(item)
         if scraped:
             return scraped
 
-        existing = _pick_existing_description(item)
-        if existing:
-            return existing
-
-        return _compose_metadata_description(item)
-
     existing = _pick_existing_description(item)
     if existing:
         return existing
+
+    return None
+
+
+def build_metadata_text(item: dict) -> str:
+    """ジャンル・出演・シリーズ・メーカー等の構造化メタ情報テキストを生成。"""
     return _compose_metadata_description(item)
+
+
+# 後方互換のため旧名も残す
+def fallback_description(item: dict) -> str:
+    """[非推奨] 互換用。新コードでは build_intro_text + build_metadata_text を使用。"""
+    intro = build_intro_text(item)
+    return intro or build_metadata_text(item)
 
 
 # ============================================================
@@ -918,20 +923,47 @@ def _build_post_content(
     title: str,
     affiliate_link: str,
     images: list[str],
-    description: str,
+    intro_text: Optional[str],
+    metadata_text: str,
 ) -> str:
-    """投稿本文HTMLを組み立てる。"""
+    """
+    投稿本文HTMLを組み立てる。
+
+    構成:
+      1. メインビジュアル（アフィリエイトリンク付き）
+      2. タイトルリンク
+      3. 紹介文セクション（あれば）：あらすじ・コメント本文
+      4. メタ情報セクション：ジャンル・出演・メーカー等
+      5. ギャラリー画像（2枚目以降）
+      6. タイトルリンク（再掲）
+    """
     affiliate_tag_attrs = 'target="_blank" rel="nofollow noopener"'
 
-    parts = [
+    parts: list[str] = [
         f'<p><a href="{affiliate_link}" {affiliate_tag_attrs}>'
         f'<img src="{images[0]}" alt="{title}"></a></p>',
         f'<p><a href="{affiliate_link}" {affiliate_tag_attrs}>{title}</a></p>',
-        f'<div>{description}</div>',
     ]
+
+    # 紹介文（あらすじ・コメント）セクション
+    if intro_text:
+        parts.append(
+            f'<div class="vr-intro"><h3>作品紹介</h3>'
+            f'<p>{intro_text}</p></div>'
+        )
+
+    # メタ情報（ジャンル・出演者・メーカー等）セクション
+    parts.append(
+        f'<div class="vr-meta"><h3>作品情報</h3>'
+        f'<p>{metadata_text}</p></div>'
+    )
+
+    # ギャラリー画像
     parts.extend(
         f'<p><img src="{img}" alt="{title}"></p>' for img in images[1:]
     )
+
+    # 末尾にタイトルリンク再掲
     parts.append(
         f'<p><a href="{affiliate_link}" {affiliate_tag_attrs}>{title}</a></p>'
     )
@@ -969,10 +1001,13 @@ def create_wp_post(item: dict, wp: Client, category: str, affiliate_id: str) -> 
     thumbnail_id = uploaded[0]["id"]
     wp_image_urls = [u["url"] for u in uploaded if u.get("url")]
 
-    # 本文組み立て
+    # 本文組み立て（紹介文セクション ＋ メタ情報セクションを分けて生成）
     affiliate_link = make_affiliate_link(item["URL"], affiliate_id)
-    description = fallback_description(item)
-    content = _build_post_content(title, affiliate_link, wp_image_urls, description)
+    intro_text = build_intro_text(item)
+    metadata_text = build_metadata_text(item)
+    content = _build_post_content(
+        title, affiliate_link, wp_image_urls, intro_text, metadata_text
+    )
 
     # タグ抽出（ジャンル等）
     tags = _extract_tags_from_item(item)
