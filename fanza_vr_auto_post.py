@@ -158,6 +158,14 @@ DESC_SELECTORS_META = [
 # JSON-LDから説明文を取り出すときに見るキー
 JSONLD_DESC_KEYS = ("description", "abstract", "headline")
 
+# JSON（__NEXT_DATA__ 等）内で説明文として扱うキー名
+JSON_DESC_KEYS = (
+    "description", "longDescription", "shortDescription",
+    "comment", "caption", "summary", "synopsis",
+    "story", "abstract", "body", "text", "content",
+    "introduction", "outline", "overview",
+)
+
 # 「メタ情報っぽい」と判定するためのパターン（スコアペナルティ用）
 METADATA_LIKE_PATTERNS = (
     "ジャンル：", "ジャンル:",
@@ -620,6 +628,65 @@ def _collect_candidates_from_jsonld(soup: BeautifulSoup) -> list[tuple[int, str,
     return results
 
 
+def _walk_json_for_descriptions(
+    obj: Any, max_depth: int = 12, _depth: int = 0
+) -> Iterator[tuple[str, str]]:
+    """
+    JSON オブジェクトを再帰的に走査し、説明文として使えそうな (キー, 値) を yield する。
+    キー名が JSON_DESC_KEYS に含まれ、値が文字列であれば対象。
+    """
+    if _depth > max_depth:
+        return
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            key_lower = str(key).lower()
+            if isinstance(value, str) and any(k in key_lower for k in JSON_DESC_KEYS):
+                yield (str(key), value)
+            else:
+                yield from _walk_json_for_descriptions(value, max_depth, _depth + 1)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _walk_json_for_descriptions(item, max_depth, _depth + 1)
+
+
+def _collect_candidates_from_next_data(soup: BeautifulSoup) -> list[tuple[int, str, str]]:
+    """
+    Next.js の __NEXT_DATA__ や、その他のインライン JSON スクリプトから
+    説明文候補を収集する。video.dmm.co.jp（React/Next.js製）対策。
+    """
+    results: list[tuple[int, str, str]] = []
+    script_selectors = [
+        ("script", {"id": "__NEXT_DATA__"}),
+        ("script", {"id": "__NUXT_DATA__"}),
+        ("script", {"id": "__APOLLO_STATE__"}),
+        ("script", {"type": "application/json"}),
+    ]
+    seen_scripts: set[int] = set()
+
+    for tag_name, attrs in script_selectors:
+        for script in soup.find_all(tag_name, attrs=attrs):
+            sid = id(script)
+            if sid in seen_scripts:
+                continue
+            seen_scripts.add(sid)
+
+            raw = script.string or script.get_text() or ""
+            raw = raw.strip()
+            if not raw or not (raw.startswith("{") or raw.startswith("[")):
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+
+            for key, value in _walk_json_for_descriptions(data):
+                text = _clean_text(value)
+                score = _score_description(text)
+                if score > 0:
+                    results.append((score, text, f"json:{key}"))
+    return results
+
+
 def _collect_longest_paragraphs(soup: BeautifulSoup) -> list[tuple[int, str, str]]:
     """フォールバック: 全 p/div からスコア付き候補を収集。"""
     results: list[tuple[int, str, str]] = []
@@ -644,7 +711,9 @@ def _extract_description_from_html(html_text: str) -> Optional[str]:
     candidates: list[tuple[int, str, str]] = []
     # 本文系セレクタ（最優先）
     candidates.extend(_collect_candidates_from_selectors(soup, DESC_SELECTORS_BODY, "body"))
-    # JSON-LD
+    # Next.js / Nuxt / Apollo の埋め込みJSONから探索（video.dmm.co.jp等の動的レンダリング対策）
+    candidates.extend(_collect_candidates_from_next_data(soup))
+    # JSON-LD（構造化データ）
     candidates.extend(_collect_candidates_from_jsonld(soup))
     # メタタグ（最終手段）- 低めの最大スコアにするため上限を300に圧縮
     meta_candidates = _collect_candidates_from_selectors(soup, DESC_SELECTORS_META, "meta")
