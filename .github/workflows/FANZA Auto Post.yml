@@ -39,4 +39,11 @@ jobs:
           TAG_FIELDS: "genre,actress,maker"  # タグ化するiteminfoフィールド（ジャンル＋出演者＋メーカー名）
           MAX_TAGS: "30"                     # タグ数の上限
           AUTO_MATCH_CATEGORY: "1"           # 1=タグ名と一致する既存WPカテゴリも自動チェック
+          # ===== SEO設定 =====
+          SEO_EXCERPT: "1"            # post_excerpt(抜粋)を自動生成
+          SEO_EXCERPT_LEN: "140"      # 抜粋の最大文字数
+          SEO_SLUG: "1"               # CIDベースのSEOフレンドリーURLスラッグ
+          SEO_SLUG_PREFIX: "vr-"      # スラッグの接頭辞
+          SEO_SCHEMA: "1"             # Schema.org Product JSON-LDを本文に埋込
+          SEO_YOAST: "0"              # Yoast SEOプラグイン使用時のみ"1"
         run: python fanza_vr_auto_post.py
