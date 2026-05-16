@@ -110,6 +110,8 @@ class Config:
     MAX_TAGS = int(os.getenv("MAX_TAGS", "30"))
     # タグ名と一致する既存WPカテゴリも自動でチェック（割り当て）するか
     AUTO_MATCH_CATEGORY = os.getenv("AUTO_MATCH_CATEGORY", "1") == "1"
+    # スクレイピングのデバッグ出力（"1"で詳細ログ、"2"でHTMLをファイル保存）
+    SCRAPE_DEBUG = os.getenv("SCRAPE_DEBUG", "1")
 
 
 # 説明文として採用する文字数の範囲
@@ -734,27 +736,66 @@ def _extract_description_from_html(html_text: str) -> Optional[str]:
     return best_text
 
 
+def _dump_html_for_debug(item: dict, url: str, html_text: str) -> None:
+    """SCRAPE_DEBUG=2 のとき、取得HTMLを outputs/ 配下に保存（解析用）。"""
+    if Config.SCRAPE_DEBUG != "2":
+        return
+    try:
+        cid = (item.get("content_id") or item.get("product_id") or "unknown").strip()
+        safe_cid = re.sub(r"[^a-zA-Z0-9_-]", "_", cid)[:50]
+        domain = urlparse(url).netloc.replace(".", "_")
+        filename = f"debug_{safe_cid}_{domain}.html"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(html_text)
+        print(f"  [scrape-debug] HTML保存: {filename} ({len(html_text)} bytes)")
+    except Exception as e:
+        print(f"  [scrape-debug] HTML保存失敗: {e}")
+
+
 def scrape_description(item: dict) -> Optional[str]:
     """詳細ページから説明文をスクレイピングする。SCRAPE_DESCが無効なら何もしない。"""
     if not Config.SCRAPE_DESC:
         return None
 
     urls = _filter_urls_by_domain(_candidate_detail_urls(item))
+    cid = item.get("content_id") or item.get("product_id") or "?"
+    print(f"[scrape] CID={cid} 候補URL {len(urls)}件:")
+    for u in urls:
+        print(f"  - {u}")
+
     for url in urls:
         try:
             response = requests.get(
                 url, headers=_headers_for_html(),
                 timeout=GET_TIMEOUT, allow_redirects=True,
             )
+            print(
+                f"  [scrape] GET {url} → status={response.status_code} "
+                f"final_url={response.url} len={len(response.text)}"
+            )
             if not _is_success_status(response.status_code):
                 continue
+
+            # 年齢認証ページに飛ばされていないか判定
+            final_url = response.url.lower()
+            if "age_check" in final_url or "agecheck" in final_url:
+                print(f"  [scrape] 年齢認証ページに転送（COOKIE未設定/期限切れの可能性）")
+                continue
+
             response.encoding = response.apparent_encoding or response.encoding
+            _dump_html_for_debug(item, url, response.text)
+
             description = _extract_description_from_html(response.text)
             if description:
+                preview = description[:60].replace("\n", " ")
+                print(f"  [scrape] 取得成功: len={len(description)} preview='{preview}...'")
                 return description
+            print(f"  [scrape] このURLからは説明文が抽出できず（次のURL試行）")
         except Exception as e:
-            print(f"[スクレイピング失敗] {url}: {e}")
+            print(f"  [scrape] 失敗 {url}: {e}")
             continue
+
+    print(f"  [scrape] 全URLで説明文取得失敗 → メタ情報フォールバックに移行")
     return None
 
 
